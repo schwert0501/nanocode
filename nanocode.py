@@ -8,10 +8,12 @@ import glob as globlib, json, logging, os, re, subprocess, urllib.request
 try:
     import readline  # noqa: F401
 except ImportError:
-    pass
+    readline = None
 
 # 会话持久化：存/读/列历史会话，详见 session.py
 import session
+# 命令元数据与 Tab 补全：命令表 + /help + 候选中文显示，详见 commands.py
+import commands
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -261,7 +263,9 @@ def main():
               f"OPENROUTER_API_KEY 或 ANTHROPIC_API_KEY 后再运行。{RESET}")
         return
     # 打印启动信息：工具名、模型、接入渠道、当前工作目录
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
+    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}")
+    print(f"{DIM}输入 {CYAN}/help{RESET}{DIM} 查看命令，/ 后按 Tab 可补全{RESET}\n")
+    commands.setup_completion(readline)  # 配置命令 Tab 补全与候选中文显示
     messages = []  # 对话历史，贯穿整个会话
     session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"  # 系统提示
@@ -279,6 +283,12 @@ def main():
                 continue                      # 空输入则跳过
             if user_input in ("/q", "exit"):
                 break                         # 退出程序
+            if commands.is_help(user_input):
+                # /help、-h、--help 都显示命令帮助
+                print(commands.format_help({
+                    "BOLD": BOLD, "CYAN": CYAN, "DIM": DIM, "RESET": RESET,
+                }))
+                continue
             if user_input == "/c":
                 messages = []                 # /c 清空对话历史
                 session_id = session.new_session_id()  # 清空后开启一个全新会话
