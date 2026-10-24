@@ -1,0 +1,9 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+
+# 运行时生成的会话历史（含对话内容，不应入库）
+.nanocode_sessions/
+
+# 编辑器本地配置
+.vscode/
