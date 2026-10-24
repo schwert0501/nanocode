@@ -4,6 +4,15 @@
 # glob 和内置的 glob 工具函数重名，所以用 globlib 别名导入标准库
 import glob as globlib, json, logging, os, re, subprocess, urllib.request
 
+# 仅导入即可让 input() 启用 readline 行编辑（左右移动、退格重绘更正常）
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass
+
+# 会话持久化：存/读/列历史会话，详见 session.py
+import session
+
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
     level=logging.INFO,
@@ -21,17 +30,12 @@ def _mask(secret):
     return f"{secret[:4]}***{secret[-4:]}"
 
 
-# 从环境变量读取 OpenRouter 的 key；如果存在就走 OpenRouter，否则走 Anthropic 官方
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-logger.info("OPENROUTER_KEY = %s", _mask(OPENROUTER_KEY))
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "sk-2Y30lbbXjAOOgGUU741358E9764e41019aC0Df5cD8Fc4a31")
-logger.info("ANTHROPIC_API_KEY = %s", _mask(ANTHROPIC_API_KEY))
-# 根据有没有 OpenRouter key，选择不同的 API 接入地址
-API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://oneapi-comate.baidu-int.com/v1/messages"
-logger.info("API_URL = %s", API_URL)
-# 模型名也可被环境变量 MODEL 覆盖，否则按接入渠道用默认的 Opus 模型
+# 密钥统一从环境变量读取，不再硬编码到源码里（避免泄露 / 误提交进仓库）
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# API 地址和模型也支持用环境变量覆盖，方便切换渠道/模型，缺省回退到默认值
+API_URL = os.environ.get("API_URL", "https://oneapi-comate.baidu-int.com/v1/messages")
 MODEL = os.environ.get("MODEL", "Opus 4.8")
-logger.info("MODEL = %s", MODEL)
 
 # ANSI 终端转义色码：用来给终端输出上色/加粗/变暗
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -222,7 +226,7 @@ def call_api(messages, system_prompt):
         data=json.dumps(
             {
                 "model": MODEL,
-                "max_tokens": 8192,
+                "max_tokens": 32000,
                 "system": system_prompt,
                 "messages": messages,
                 "tools": make_schema(),
@@ -251,9 +255,15 @@ def render_markdown(text):
 
 def main():
     """程序主入口：实现一个交互式命令行 AI coding 助手"""
+    # 启动前校验：两种渠道的密钥都没配置则直接报错退出，避免发出无效请求
+    if not OPENROUTER_KEY and not ANTHROPIC_API_KEY:
+        print(f"{RED}⏺ 未检测到 API 密钥。请先设置环境变量 "
+              f"OPENROUTER_API_KEY 或 ANTHROPIC_API_KEY 后再运行。{RESET}")
+        return
     # 打印启动信息：工具名、模型、接入渠道、当前工作目录
     print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
     messages = []  # 对话历史，贯穿整个会话
+    session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"  # 系统提示
 
     # 外层循环：不断读取用户输入
@@ -261,7 +271,9 @@ def main():
         try:
             print(separator())
             # 读取用户输入并去除首尾空白
-            user_input = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
+            # 提示符里的 ANSI 颜色码用 \001\002 包裹，告诉 readline 这些字符不占显示宽度，
+            # 否则退格编辑时光标位置会算错、屏幕重绘错位（内容其实是对的）
+            user_input = input(f"\001{BOLD}{BLUE}\002❯\001{RESET}\002 ").strip()
             print(separator())
             if not user_input:
                 continue                      # 空输入则跳过
@@ -269,7 +281,34 @@ def main():
                 break                         # 退出程序
             if user_input == "/c":
                 messages = []                 # /c 清空对话历史
+                session_id = session.new_session_id()  # 清空后开启一个全新会话
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
+                continue
+            if user_input == "/sessions":
+                # 列出历史会话，供用户选择恢复
+                sessions = session.list_sessions()
+                if not sessions:
+                    print(f"{DIM}暂无历史会话{RESET}")
+                else:
+                    print(f"{BOLD}历史会话{RESET}（用 {CYAN}/resume <编号>{RESET} 恢复）:")
+                    for idx, s in enumerate(sessions):
+                        marker = f"{GREEN} (当前){RESET}" if s["id"] == session_id else ""
+                        print(f"  {BOLD}{idx}{RESET} {DIM}{s['id']}{RESET}  {s['preview']}{marker}")
+                continue
+            if user_input.startswith("/resume"):
+                # 恢复到某个历史会话，后续对话将继续写入该会话文件
+                parts = user_input.split()
+                sessions = session.list_sessions()
+                if len(parts) < 2 or not parts[1].isdigit():
+                    print(f"{YELLOW}用法: /resume <编号>，先用 /sessions 查看编号{RESET}")
+                    continue
+                idx = int(parts[1])
+                if idx < 0 or idx >= len(sessions):
+                    print(f"{RED}⏺ 编号超出范围{RESET}")
+                    continue
+                session_id = sessions[idx]["id"]
+                messages = session.load_session(session_id)
+                print(f"{GREEN}⏺ 已恢复会话 {session_id}（{len(messages)} 条消息）{RESET}")
                 continue
 
             messages.append({"role": "user", "content": user_input})
@@ -322,6 +361,9 @@ def main():
                     break
                 # 否则把工具结果作为 user 消息回传，让模型继续处理
                 messages.append({"role": "user", "content": tool_results})
+
+            # 每轮对话结束后自动保存会话，实现无感记忆
+            session.save_session(session_id, messages)
 
             print()
 
