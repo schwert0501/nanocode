@@ -47,22 +47,47 @@ def setup_completion(readline):
     if readline is None:
         return
 
+    # 记录"补全前"用户已输入的文本。重绘输入行时要用它而不是当前的
+    # line buffer：唯一候选被补全后，readline 还会把新插入的后缀再画一次，
+    # 若用已补全的 buffer 重绘会得到 "/resumeme" 这种重复。用补全前的文本
+    # 重绘，让 readline 补上后缀后正好拼成完整命令。
+    _orig_text = [""]
+
     def _completer(text, state):
         # 返回第 state 个以 text 为前缀的命令，没有更多则返回 None
+        if state == 0:
+            _orig_text[0] = text
         matches = [c for c in COMMANDS if c.startswith(text)]
+        # 只有一个候选时，readline 会直接补全、不触发"多候选展示"钩子，
+        # 中文说明就没机会显示。这里加一个带制表符的"假候选"（和真命令
+        # 共享前缀、不会改变实际补全结果），配合 show-all-if-ambiguous
+        # 强制走展示钩子，从而把中文说明打印出来。
+        if len(matches) == 1:
+            matches = [matches[0], matches[0] + "\t"]
         return matches[state] if state < len(matches) else None
 
     def _display(substitution, matches, longest_match_length):
-        # Tab 列出多个候选时，顺带打印每个命令的中文说明
+        # Tab 列出候选时，顺带打印每个命令的中文说明
         print()
+        seen = set()
         for m in matches:
-            desc = COMMANDS.get(m, "")
-            print(f"  {m}\t{desc}")
-        # 重绘用户当前已输入的内容（上面的 print 会把输入行冲掉）
-        print(f"❯ {readline.get_line_buffer()}", end="", flush=True)
+            cmd = m.strip()  # 去掉"假候选"的制表符
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            print(f"  {cmd}\t{COMMANDS.get(cmd, '')}")
+        # 用"补全前"的文本重绘输入行（上面的 print 会把输入行冲掉）
+        print(f"❯ {_orig_text[0]}", end="", flush=True)
 
     try:
+        # 默认补全分隔符里含有 "/"，会把 "/resu" 从斜杠处切开，
+        # 只把 "resu" 传给补全函数，导致以 "/" 开头的命令永远匹配不到。
+        # 这里把分隔符改成仅空白字符，让整个 "/resu" 作为一个词参与补全。
+        readline.set_completer_delims(" \t\n")
         readline.set_completer(_completer)
+        # 让单个/多个候选在第一次 Tab 就直接列出（否则默认要按两次），
+        # 也是"假候选"方案能即时显示中文说明的前提。
+        readline.parse_and_bind("set show-all-if-ambiguous on")
         # macOS 自带的是 libedit 而非 GNU readline，Tab 绑定语法不同
         if "libedit" in (readline.__doc__ or ""):
             readline.parse_and_bind("bind ^I rl_complete")
