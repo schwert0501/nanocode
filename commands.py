@@ -16,6 +16,7 @@ COMMANDS = {
     "/undo": "撤销最近一次文件改动（等价于回滚编号最大的那条）",
     "/revert": "回滚指定编号的文件改动（用法：/revert <编号>）",
     "/kb": "知识库：/kb index <目录> 建索引、/kb update <目录> 增量更新、/kb stat 看概况",
+    "/skills": "列出内置 SKILL（团队标准流程/检查清单）及其触发场景",
     "/q": "退出 nanocode",
 }
 

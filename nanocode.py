@@ -7,6 +7,13 @@ import difflib, glob as globlib, json, logging, os, re, subprocess, urllib.reque
 # 仅导入即可让 input() 启用 readline 行编辑（左右移动、退格重绘更正常）
 try:
     import readline  # noqa: F401
+    # 开启 bracketed paste（括号粘贴）模式：粘贴多行文本时，终端会用转义序列
+    # 把整段内容包起来，readline 据此把粘贴里的换行当普通字符插入缓冲区，
+    # 而不是逐行触发 input() 返回（否则会出现“边粘贴边提问”）。需 GNU readline ≥ 8.1。
+    try:
+        readline.parse_and_bind("set enable-bracketed-paste on")
+    except Exception:
+        pass
 except ImportError:
     readline = None
 
@@ -20,6 +27,8 @@ import commands
 import compact
 # 领域知识库：纯标准库 BM25 检索，支持构建期建索引、随包分发，详见 kb.py
 import kb
+# 内置技能（SKILL）：领域专用的提示词/标准流程，清单常驻、正文按需加载，详见 skills.py
+import skills
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -264,6 +273,13 @@ TOOLS = {
         {"query": "string", "k": "number?"},
         kb.kb_search,
     ),
+    "skill": (
+        "Load a built-in SKILL (team's standard workflow/checklist) by name or "
+        "keyword. When a request matches a SKILL's trigger scenario, call this "
+        "FIRST to load the standard steps, then follow them.",
+        {"name": "string"},
+        skills.skill_use,
+    ),
 }
 
 
@@ -449,13 +465,31 @@ def main():
     commands.setup_completion(readline)  # 配置命令 Tab 补全与候选中文显示
     messages = []  # 对话历史，贯穿整个会话
     session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
-    system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"  # 系统提示
+    # 系统提示：先给 agent 一个明确身份（汽车团队的工作流「小强」），
+    # 再按需拼接知识库 / SKILL 的使用引导。
+    system_prompt = (
+        "你是「小强」，汽车团队的工作流助手，专门负责算子（suanzi）开发"
+        "和数据分析相关的工作。你熟悉团队的开发规范与取数/分析流程，"
+        "回答与动手时优先遵循团队沉淀的标准做法，保持简洁高效。\n"
+        f"Concise coding assistant. cwd: {os.getcwd()}"
+    )
     # 若已内置领域知识库，提示模型优先检索，避免凭空作答
     if kb.stat().get("built"):
         system_prompt += (
             " A domain knowledge base is available via the kb_search tool. "
             "For project/domain-specific questions, call kb_search first, "
             "then read full files if needed before answering."
+        )
+    # 若已内置 SKILL，把清单注入 system prompt，并引导「命中触发场景就默认加载」。
+    # 这就是「机智诱惑」：让模型遇到常见任务时主动走团队标准流程，提升效果。
+    skill_manifest = skills.manifest()
+    if skill_manifest:
+        system_prompt += (
+            "\n\n可用的内置 SKILL（团队标准流程/检查清单）如下。"
+            "当用户的请求命中某个 SKILL 的触发场景时，"
+            "请先调用 skill 工具按名称加载它的完整步骤，再照着执行；"
+            "不要跳过、也不要临场自行发挥：\n"
+            + skill_manifest
         )
 
     # 外层循环：不断读取用户输入
@@ -593,7 +627,23 @@ def main():
                 print(f"{color}⏺ {result['msg']}{RESET}")
                 continue
 
+            if user_input == "/skills":
+                # 列出内置 SKILL 及其触发场景，让用户知道有哪些标准流程可用
+                items = skills.list_skills()
+                if not items:
+                    print(f"{DIM}暂无内置 SKILL（.nanocode_skills/ 为空）{RESET}")
+                else:
+                    print(f"{BOLD}内置 SKILL{RESET}（命中触发场景时小强会自动加载并执行）:")
+                    for s in items:
+                        trig = f"  {DIM}触发：{', '.join(s['triggers'])}{RESET}" if s["triggers"] else ""
+                        print(f"  {CYAN}{s['name']}{RESET}  {s['description']}{trig}")
+                continue
+
             messages.append({"role": "user", "content": user_input})
+
+            # 收到任务后立即给出可见反馈：避免"回车后到模型首字返回前"的空窗期
+            # 让用户确认消息已收到、助手已开始干活，而不是卡死
+            print(f"\n{BOLD}{GREEN}🤖 小强开始干活…{RESET}", flush=True)
 
             # agentic loop（智能体循环）：持续调用 API，直到模型不再请求调用工具
             while True:
