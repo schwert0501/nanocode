@@ -15,12 +15,14 @@ nanocode 是一个交互式命令行 AI 编码助手。用户在终端里输入�
 |------|------|
 | `nanocode.py` | 主程序:工具实现、工具注册表、API 调用、agentic loop、命令行交互 |
 | `session.py` | 会话持久化:把对话历史存成 JSON,支持列出和恢复历史会话 |
+| `kb.py` | 领域知识库:构建期把语料切块建 BM25 索引,运行期供 `kb_search` 工具检索(纯标准库) |
 
 运行时数据:
 
 | 路径 | 说明 |
 |------|------|
 | `.nanocode_sessions/` | 每个会话一个 JSON 文件,文件名为时间戳(如 `20261024_124341.json`) |
+| `.nanocode_kb/` | 领域知识库索引(构建期生成、随分发包携带):`config.json`/`chunks.jsonl`/`index.json`/`sources.json` |
 
 ---
 
@@ -107,6 +109,45 @@ nanocode 是一个交互式命令行 AI 编码助手。用户在终端里输入�
 - 主循环捕获 `KeyboardInterrupt`/`EOFError`(Ctrl+C/Ctrl+D 优雅退出)及其它异常(打印后继续)
 - `_mask()` 提供密钥脱敏能力(用于日志)
 
+### 3.7 领域知识库(第一期:BM25 + agentic search)
+
+让 nanocode 变成「自带领域知识」的 agent:构建期把一批语料(文档/代码)切块并建一份轻量检索索引,随分发包一起交付给团队;运行期模型通过 `kb_search` 工具自主检索,命中后再决定要不要用 `read` 读完整原文。实现见 `kb.py`。
+
+**为什么是 BM25 而不是向量检索**
+
+| 维度 | 第一期:BM25(已实现) | 向量检索(第二期) |
+|------|----------------------|--------------------|
+| 依赖 | 纯标准库,零第三方 | 需要 embedding 模型 + 向量库 |
+| 分发 | 索引是纯 JSON,解压即用 | 需随包带模型或联网调 API |
+| 适合 | 关键词/专有名词/代码符号命中 | 语义近似、换一种说法也能召回 |
+
+> 关键澄清:**生成模型 ≠ embedding 模型**。用当前对话大模型「当 embedding」既慢又贵且不对口;BM25 是稀疏词频检索,不是向量检索。**agentic search 是范式**(模型自主决定搜不搜、搜几次、要不要深读),BM25 / 向量只是 `kb_search` 内部可替换的后端。第一期先用零依赖的 BM25 把范式跑通。
+
+**存储布局(`.nanocode_kb/`)**
+
+| 文件 | 内容 |
+|------|------|
+| `config.json` | 后端标识(`bm25`)、BM25 超参(k1/b)、分块参数、tokenizer 标识 |
+| `chunks.jsonl` | 每行一个片段 `{id, source, start_line, end_line, title, text}` |
+| `index.json` | BM25 稀疏索引 `{df, doc_len, tf, avg_len, n_docs}` |
+| `sources.json` | `{文件路径: mtime}`,支撑增量重建 |
+
+**切块策略**(`kb.py`):Markdown 按 `#` 标题层级切并用栈维护标题路径;代码按 `def`/`class` 等正则粗切、取首符号行作标题;其它按长度切。过长片段带 120 字重叠二次切(`CHUNK_MAX_CHARS=1200`)。行号从 1 起,便于检索结果直接与 `read` 联动。
+
+**检索与分词**:BM25 打分 `idf(t)=ln((N-df+0.5)/(df+0.5)+1)`,带文档长度归一化;分词对英文/数字/下划线按正则切词,对中文切 bi-gram(相邻两字)并加单字兜底,保证中文也能召回。
+
+**命令**
+
+| 命令 | 作用 |
+|------|------|
+| `/kb index <目录>` | 全量重建索引(指向语料目录) |
+| `/kb update <目录>` | 增量更新(按 mtime 只重切变更文件,跳过未变文件) |
+| `/kb stat` | 查看概况(后端、片段数、来源文件数、索引目录) |
+
+建好索引后,`main()` 会在 system prompt 里提示模型「遇到项目/领域问题先 `kb_search`」,`TOOLS` 注册表中的 `kb_search` 即对模型可见。
+
+**分发给团队的思路**:开发仓库里 `.nanocode_kb/` 不入库(见 `.gitignore`),避免把测试语料/大体积索引误提交。打包时由打包脚本针对**正式语料**现场 `/kb index` 生成索引,再把 `*.py` + `.nanocode_kb/` 一起压成 zip/目录交付——对方解压即用、零依赖、无需联网建库。
+
 ---
 
 ## 4. 如何运行
@@ -187,6 +228,10 @@ TOOLS = {
 | 子任务 / 子 agent | 把大任务拆给独立子 agent 并行执行(读多文件、跑多测试) |
 | 智能忽略 | 遵循 `.gitignore`,搜索时跳过 `node_modules`/`.git` 等 |
 | 项目记忆文件 | 读取类似 `AGENTS.md`/`README` 自动注入 system prompt,了解项目约定 |
+| 知识库:向量检索后端 | 在 `kb_search` 下加「向量/稠密」后端,语义召回(换种说法也能命中):构建期调 embedding API 生成片段向量存入 `.nanocode_kb/vectors.*`,检索期对 query 向量做余弦 Top-k。后端通过 `config.json` 的 `backend` 字段可切换,与 BM25 并存 |
+| 知识库:hybrid 混合检索 | BM25(稀疏)+ 向量(稠密)结果用 RRF(Reciprocal Rank Fusion)融合排序,兼顾关键词精确命中与语义泛化 |
+| 知识库:内置 SKILL / 工具包 | 把领域专用的提示词、检查清单、脚手架脚本做成可随包分发的 SKILL,和 `.nanocode_kb/` 一样「构建期打包、解压即用」 |
+| 知识库:一键打包分发 | 打包脚本:针对正式语料 `/kb index` → 把 `*.py` + `.nanocode_kb/`(+ 可选 SKILL)打成 zip 或 PyInstaller onedir,团队成员解压/双击即用,无需配环境 |
 
 ### 阶段三:工程化与体验
 | 功能 | 说明 |

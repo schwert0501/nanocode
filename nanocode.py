@@ -18,6 +18,8 @@ import changelog
 import commands
 # 上下文自动压缩：历史过长时把较早消息压成摘要，详见 compact.py
 import compact
+# 领域知识库：纯标准库 BM25 检索，支持构建期建索引、随包分发，详见 kb.py
+import kb
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -256,6 +258,12 @@ TOOLS = {
         {"cmd": "string"},
         bash,
     ),
+    "kb_search": (
+        "Search the domain knowledge base for relevant snippets (BM25). "
+        "Use this first for project/domain-specific questions before answering.",
+        {"query": "string", "k": "number?"},
+        kb.kb_search,
+    ),
 }
 
 
@@ -442,6 +450,13 @@ def main():
     messages = []  # 对话历史，贯穿整个会话
     session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"  # 系统提示
+    # 若已内置领域知识库，提示模型优先检索，避免凭空作答
+    if kb.stat().get("built"):
+        system_prompt += (
+            " A domain knowledge base is available via the kb_search tool. "
+            "For project/domain-specific questions, call kb_search first, "
+            "then read full files if needed before answering."
+        )
 
     # 外层循环：不断读取用户输入
     while True:
@@ -559,6 +574,22 @@ def main():
                 number = int(parts[1].lstrip("#"))
                 result = changelog.revert_change(number)
                 color = GREEN if result["ok"] else RED
+                print(f"{color}⏺ {result['msg']}{RESET}")
+                continue
+
+            if user_input.startswith("/kb"):
+                # 知识库命令：/kb index <目录> 建索引、/kb update <目录> 增量、/kb stat 看概况
+                parts = user_input.split(maxsplit=2)
+                sub = parts[1] if len(parts) > 1 else ""
+                if sub in ("index", "update"):
+                    path = parts[2] if len(parts) > 2 else ""
+                    result = kb.cmd_index(path, append=(sub == "update"))
+                elif sub == "stat":
+                    result = kb.cmd_stat()
+                else:
+                    result = {"ok": False,
+                              "msg": "用法: /kb index <目录> | /kb update <目录> | /kb stat"}
+                color = GREEN if result["ok"] else YELLOW
                 print(f"{color}⏺ {result['msg']}{RESET}")
                 continue
 
