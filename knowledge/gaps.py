@@ -28,8 +28,10 @@ import json
 import os
 import urllib.request
 
-# 缺口记录存放在脚本同级 .nanocode_gaps/ 目录（与 cwd 无关，便于集中管理）
-GAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nanocode_gaps")
+# 缺口记录存放在项目根目录 .nanocode_gaps/（与 cwd 无关，便于集中管理）。
+# 本模块位于 knowledge/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GAPS_DIR = os.path.join(_BASE_DIR, ".nanocode_gaps")
 GAPS_FILE = os.path.join(GAPS_DIR, "gaps.jsonl")
 
 # 可选：对象存储/接收端点。仅当设置了该环境变量时才尝试上传（HTTP）。

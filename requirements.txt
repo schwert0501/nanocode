@@ -1,0 +1,16 @@
+# nanocode 依赖清单
+#
+# 核心运行时：零第三方依赖。nanocode 仅用 Python 标准库即可运行
+# （HTTP 请求走 urllib、知识库 BM25 检索走纯标准库实现）。
+# 只要有 Python 3.8+ 即可“解压即用”，无需 pip install。
+#
+# ─────────────────────────────────────────────────────────────
+# 可选：知识库“第二版本”语义检索后端（/kb index --backend vector|hybrid）
+# ─────────────────────────────────────────────────────────────
+# 安装后，知识库可从 BM25 关键词检索升级为本地 embedding 语义检索，
+# 首次使用会自动下载一个小型中文向量模型（默认 BAAI/bge-small-zh-v1.5，约 95MB）。
+# 不安装则自动回退到 BM25，不影响其余功能。
+#
+#   pip install sentence-transformers
+#
+# sentence-transformers>=2.2.0

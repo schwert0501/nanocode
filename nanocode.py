@@ -2,7 +2,7 @@
 """nanocode - minimal claude code alternative"""
 
 # glob 和内置的 glob 工具函数重名，所以用 globlib 别名导入标准库
-import difflib, glob as globlib, json, logging, os, re, subprocess, sys, urllib.request
+import difflib, glob as globlib, itertools, json, logging, os, re, subprocess, sys, threading, time, urllib.request
 
 # 仅导入即可让 input() 启用 readline 行编辑（左右移动、退格重绘更正常）
 try:
@@ -17,22 +17,17 @@ try:
 except ImportError:
     readline = None
 
-# 会话持久化：存/读/列历史会话，详见 session.py
-import session
-# 改动记录：记录每次文件写入/编辑的全量快照，支持审计与回滚，详见 changelog.py
-import changelog
-# 命令元数据与 Tab 补全：命令表 + /help + 候选中文显示，详见 commands.py
-import commands
-# 上下文自动压缩：历史过长时把较早消息压成摘要，详见 compact.py
-import compact
-# 领域知识库：纯标准库 BM25 检索，支持构建期建索引、随包分发，详见 kb.py
-import kb
-# 内置技能（SKILL）：领域专用的提示词/标准流程，清单常驻、正文按需加载，详见 skills.py
-import skills
-# agent 身份与领域本体：从 AGENTS.md 解析身份/术语表/协作约定注入 system_prompt，详见 agent_config.py
-import agent_config
-# 知识缺口记录：知识库也查不到时登记缺口（可选上传对象存储），供持续完善 agent，详见 gaps.py
-import gaps
+# 会话持久化：存/读/列历史会话，详见 session/session.py
+# 改动记录：记录每次文件写入/编辑的全量快照，支持审计与回滚，详见 session/changelog.py
+# 上下文自动压缩：历史过长时把较早消息压成摘要，详见 session/compact.py
+from session import session, changelog, compact
+# 命令元数据与 Tab 补全：命令表 + /help + 候选中文显示，详见 tools/commands.py
+from tools import commands
+# 领域知识库：纯标准库 BM25 检索，支持构建期建索引、随包分发，详见 knowledge/kb.py
+# 内置技能（SKILL）：领域专用的提示词/标准流程，清单常驻、正文按需加载，详见 knowledge/skills.py
+# agent 身份与领域本体：从 AGENTS.md 解析身份/术语表/协作约定注入 system_prompt，详见 knowledge/agent_config.py
+# 知识缺口记录：知识库也查不到时登记缺口（可选上传对象存储），供持续完善 agent，详见 knowledge/gaps.py
+from knowledge import kb, skills, agent_config, gaps
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -67,6 +62,56 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[33m",
     "\033[31m",
 )
+
+
+class Spinner:
+    """终端加载动效：后台线程原地循环刷新一帧字符，提示"正在处理、没有卡死"。
+
+    典型用在"发出请求 → 首个响应字节到达前"的空窗期。收到首字节后调用 stop()，
+    会用回车 + 清行把动效行干净擦除，不干扰随后的流式文本输出。
+
+    设计要点：
+      - 非 tty（管道/重定向）环境自动退化为不显示，避免污染输出；
+      - stop() 幂等，重复调用安全（便于在 call_api 内与异常兜底处各停一次）；
+      - 刷新间隔 0.1s，用 Event.wait 实现，stop 时能立即被唤醒退出。
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # Braille 点阵旋转帧，视觉平滑无跳动
+
+    def __init__(self, message="小强思考中", color=CYAN):
+        self.message = message
+        self.color = color
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            # \r 回到行首原地覆盖刷新；不换行，保持转圈效果
+            sys.stdout.write(f"\r{self.color}{frame}{RESET} {DIM}{self.message}…{RESET}")
+            sys.stdout.flush()
+            self._stop.wait(0.1)           # 可被 stop() 立即唤醒，响应更跟手
+
+    def start(self):
+        # 非交互终端（管道/重定向）下不启动动效，避免把转义字符写进输出
+        if not sys.stdout.isatty():
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        # 幂等：无运行线程直接返回，重复调用安全
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join()
+        self._thread = None
+        # 擦除动效所在整行：回车到行首 + ANSI 清行到行尾（\033[K）
+        # 用 ANSI 清行而非固定宽度空格，中英文混排/任意消息长度都能擦干净
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
 
 
 # =========================================================================
@@ -513,7 +558,22 @@ def call_api(messages, system_prompt, live=False):
             **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": ANTHROPIC_API_KEY}),
         },
     )
-    response = urllib.request.urlopen(request)
+    # live 模式下，在"请求发出 → 首个响应到达"的空窗期转圈，告诉用户没卡死。
+    # 收到首个内容事件时立即 stop()（擦除动效行），再开始正常的流式回显。
+    spinner = Spinner().start() if live else None
+
+    def stop_spinner():
+        # 收到首字节时调用：停掉并擦除动效行。幂等，可安全多次调用。
+        nonlocal spinner
+        if spinner is not None:
+            spinner.stop()
+            spinner = None
+
+    try:
+        response = urllib.request.urlopen(request)
+    except Exception:
+        stop_spinner()                     # 请求失败也要先把动效行清掉再抛出
+        raise
 
     # blocks[index] 保存正在拼装的内容块；按服务端给的 index 定位，
     # text 块累积 text 片段，tool_use 块累积 input 的 JSON 字符串片段
@@ -535,6 +595,7 @@ def call_api(messages, system_prompt, live=False):
         etype = event.get("type")
 
         if etype == "content_block_start":
+            stop_spinner()                 # 首个内容块到达：停掉等待动效再开始回显
             # 新内容块开始：按类型初始化一个待拼装的壳
             idx = event["index"]
             cb = event.get("content_block", {})
@@ -568,6 +629,8 @@ def call_api(messages, system_prompt, live=False):
 
         elif etype == "message_stop":
             break                          # 本条消息结束
+
+    stop_spinner()                         # 兜底：流结束仍未收到内容块时也要停动效
 
     if live and printed_prefix:
         print(flush=True)                  # 流式文本后补一个换行，收尾排版
@@ -612,6 +675,31 @@ def separator():
 def render_markdown(text):
     """极简 Markdown 渲染：把 **加粗** 语法转换成终端加粗显示"""
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
+
+
+def _parse_kb_index_args(rest):
+    """解析 /kb index|update 的参数串，拆出目录路径与可选的 --backend 值。
+
+    支持顺序任意：如 "./docs --backend hybrid" 或 "--backend vector ./docs"。
+    返回 (path, backend)；未指定后端时 backend 为 None（由 kb 沿用已有配置）。
+    """
+    tokens = rest.split()
+    backend = None
+    path_parts = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--backend":
+            backend = tokens[i + 1] if i + 1 < len(tokens) else ""
+            i += 2
+            continue
+        if tok.startswith("--backend="):
+            backend = tok.split("=", 1)[1]
+            i += 1
+            continue
+        path_parts.append(tok)
+        i += 1
+    return " ".join(path_parts), backend
 
 
 def main():
@@ -802,17 +890,26 @@ def main():
                 continue
 
             if user_input.startswith("/kb"):
-                # 知识库命令：/kb index <目录> 建索引、/kb update <目录> 增量、/kb stat 看概况
+                # 知识库命令：
+                #   /kb index <目录> [--backend bm25|vector|hybrid]  建索引
+                #   /kb update <目录> [--backend ...]                增量更新
+                #   /kb stat                                         看概况
+                #   /kb model                                        预下载/预热 embedding 模型
                 parts = user_input.split(maxsplit=2)
                 sub = parts[1] if len(parts) > 1 else ""
                 if sub in ("index", "update"):
-                    path = parts[2] if len(parts) > 2 else ""
-                    result = kb.cmd_index(path, append=(sub == "update"))
+                    rest = parts[2] if len(parts) > 2 else ""
+                    path, backend = _parse_kb_index_args(rest)
+                    result = kb.cmd_index(path, append=(sub == "update"), backend=backend)
                 elif sub == "stat":
                     result = kb.cmd_stat()
+                elif sub == "model":
+                    result = kb.cmd_model()
                 else:
                     result = {"ok": False,
-                              "msg": "用法: /kb index <目录> | /kb update <目录> | /kb stat"}
+                              "msg": ("用法: /kb index <目录> [--backend bm25|vector|hybrid]"
+                                      " | /kb update <目录> [--backend ...]"
+                                      " | /kb stat | /kb model")}
                 color = GREEN if result["ok"] else YELLOW
                 print(f"{color}⏺ {result['msg']}{RESET}")
                 continue
