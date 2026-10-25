@@ -2,7 +2,7 @@
 """nanocode - minimal claude code alternative"""
 
 # glob 和内置的 glob 工具函数重名，所以用 globlib 别名导入标准库
-import difflib, glob as globlib, json, logging, os, re, subprocess, urllib.request
+import difflib, glob as globlib, json, logging, os, re, subprocess, sys, urllib.request
 
 # 仅导入即可让 input() 启用 readline 行编辑（左右移动、退格重绘更正常）
 try:
@@ -63,6 +63,127 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[33m",
     "\033[31m",
 )
+
+
+# =========================================================================
+# --- 安全兜底机制（借鉴 Claude Code 的 permission / sandbox 分层设计）---
+# 四层防线：① Deny 硬底线  ② cwd 写边界  ③ 权限模式+确认闸门  ④ 凭证防泄漏
+# =========================================================================
+
+# ③ 权限模式：
+#   - "default": 对写操作做 cwd 边界校验，越界要确认；危险命令照样硬拦
+#   - "bypass" : 跳过 ②③（边界/确认）一切权限，自己承担风险；① 硬底线仍然拦
+# 用 --bypass 启动参数或运行中 /mode（Shift+Tab）切换
+PERMISSION_MODE = "default"
+# 记住用户在本次会话里选择「本命令不再问」批准过的操作签名，避免反复打断
+_APPROVED = set()
+
+
+# ① Deny 硬底线：无论何种权限模式都拦截的高危操作正则黑名单。
+# 这是最高优先级，连 bypass 也拦——防的是「一条命令毁掉整台电脑/系统盘」。
+_DENY_PATTERNS = [
+    # rm 递归/强制删除 根目录、家目录、$HOME、通配全删
+    (r"\brm\b(\s+-\S+)*\s+-\S*[rf]\S*(\s+-\S+)*\s+(/|~|/\*|\*|\$HOME|\$\{HOME\})(\s|/|$)",
+     "rm 递归删除 根/家目录"),
+    (r"\brm\b\s+-\S*[rf]\S*\s+--no-preserve-root", "rm --no-preserve-root"),
+    # fork 炸弹 :(){ :|:& };:
+    (r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork 炸弹"),
+    # 格式化文件系统
+    (r"\bmkfs(\.\w+)?\b", "格式化文件系统 (mkfs)"),
+    # dd 直接写裸设备
+    (r"\bdd\b[^\n]*\bof=/dev/", "dd 覆写裸设备"),
+    # 重定向覆盖磁盘设备
+    (r">\s*/dev/(sd[a-z]|nvme\d|disk\d|hd[a-z])", "重定向覆写磁盘设备"),
+    # chmod / chown -R 作用到根目录
+    (r"\bchmod\b(\s+-\S+)*\s+-\S*R\S*\s+[0-7]{3,4}\s+/(\s|$)", "chmod -R 根目录"),
+    (r"\bchown\b(\s+-\S+)*\s+-\S*R\S*\s+\S+\s+/(\s|$)", "chown -R 根目录"),
+    # 把设备/随机数直接灌进磁盘
+    (r">\s*/dev/sd", "写入磁盘设备"),
+]
+_DENY_COMPILED = [(re.compile(p), why) for p, why in _DENY_PATTERNS]
+
+
+def _deny_check(cmd):
+    """① 对一条 shell 命令做硬底线检查；命中返回拦截原因，否则返回 None。"""
+    for pat, why in _DENY_COMPILED:
+        if pat.search(cmd):
+            return why
+    return None
+
+
+def _path_in_cwd(path):
+    """② 判断目标路径（解析软链接后）是否落在当前工作目录子树内。"""
+    try:
+        real = os.path.realpath(path)
+        root = os.path.realpath(os.getcwd())
+        # 自身是 cwd，或以 "cwd/" 为前缀才算在子树内
+        return real == root or real.startswith(root + os.sep)
+    except Exception:
+        return False
+
+
+def _confirm(action, signature):
+    """③ 交互式确认闸门：返回 True 放行、False 拒绝。
+
+    - bypass 模式直接放行；
+    - 命中「本命令不再问」的签名直接放行；
+    - 否则提示三档：y 本次允许 / a 允许且不再问本类 / n 拒绝（默认拒绝）。
+    """
+    if PERMISSION_MODE == "bypass":
+        return True
+    if signature in _APPROVED:
+        return True
+    print(f"{YELLOW}⚠ 需要确认：{action}{RESET}")
+    try:
+        ans = input(
+            f"  {BOLD}允许?{RESET} "
+            f"[{GREEN}y{RESET}=本次 / {CYAN}a{RESET}=允许且不再问 / {RED}n{RESET}=拒绝] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if ans in ("a", "all"):
+        _APPROVED.add(signature)
+        return True
+    return ans in ("y", "yes")
+
+
+def _mode_banner():
+    """③ 生成当前权限模式的终端状态条，显示在输入提示符下方。"""
+    if PERMISSION_MODE == "bypass":
+        return (f"{RED}{BOLD} BYPASS {RESET}{DIM} 已跳过所有权限校验（仅保留危险命令硬拦）"
+                f" · Shift+Tab 或 /mode 切换{RESET}")
+    return (f"{GREEN}{BOLD} default {RESET}{DIM} 写操作限 cwd，越界需确认"
+            f" · Shift+Tab 或 /mode 切换{RESET}")
+
+
+# ④ 凭证防泄漏：命中这些文件名/路径特征时，read/grep 默认跳过或脱敏
+_SECRET_PATTERNS = [
+    r"(^|/)\.env(\.|$)", r"(^|/)\.env$",
+    r"id_rsa", r"id_dsa", r"id_ecdsa", r"id_ed25519",
+    r"(^|/)credentials$", r"\.pem$", r"\.key$", r"\.pfx$", r"\.p12$",
+    r"(^|/)\.npmrc$", r"(^|/)\.netrc$", r"(^|/)\.pgpass$",
+    r"(^|/)\.aws/", r"(^|/)\.ssh/", r"secrets?\.(ya?ml|json|toml)$",
+]
+_SECRET_COMPILED = [re.compile(p) for p in _SECRET_PATTERNS]
+# grep 行内敏感赋值脱敏：形如 KEY=xxx / "token": "xxx" / password: xxx
+_SECRET_LINE = re.compile(
+    r"(?i)(pass(word)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)"
+    r"['\"]?\s*[:=]\s*['\"]?([^\s'\"]{6,})"
+)
+
+
+def _is_secret_path(path):
+    """④ 判断路径是否是常见凭证/密钥文件。"""
+    p = path.replace("\\", "/")
+    return any(pat.search(p) for pat in _SECRET_COMPILED)
+
+
+def _redact_line(line):
+    """④ 对一行文本里的敏感赋值做脱敏（复用 _mask 思路）。"""
+    def _sub(m):
+        return line[m.start():m.start(3)] + _mask(m.group(3))
+    return _SECRET_LINE.sub(_sub, line)
 
 
 # --- 工具（Tool）实现 ---
@@ -133,6 +254,10 @@ def _show_and_record(tool, path, before, after):
 
 def read(args):
     """读取文件内容，并在每行前面加上行号（方便 AI 定位代码位置）"""
+    # ④ 凭证防泄漏：命中敏感文件时默认拒绝读取（bypass 模式才放行）
+    if _is_secret_path(args["path"]) and PERMISSION_MODE != "bypass":
+        return (f"error: 拒绝读取疑似凭证文件 {args['path']}（含密钥/密码风险）；"
+                f"如确需读取请用 --bypass 启动")
     lines = open(args["path"]).readlines()
     offset = args.get("offset", 0)            # 起始行偏移量，默认从第 0 行开始
     limit = args.get("limit", len(lines))     # 最多读取多少行，默认读全部
@@ -147,6 +272,10 @@ def write(args):
     写入前先读旧内容，用于生成彩色 diff 并记账，便于审计与回滚。
     """
     path = args["path"]
+    # ② cwd 写边界：越界写需确认（bypass 直接放行）
+    if not _path_in_cwd(path) and PERMISSION_MODE != "bypass":
+        if not _confirm(f"写入工作目录外的文件 {os.path.realpath(path)}", f"write-outside:{os.path.realpath(path)}"):
+            return "error: 用户拒绝：目标路径在工作目录之外"
     before = _read_if_exists(path)          # 旧内容；None 表示新建文件
     after = args["content"]
     with open(path, "w") as f:
@@ -158,6 +287,10 @@ def write(args):
 def edit(args):
     """在文件中把 old 字符串替换为 new 字符串，实现精确编辑"""
     path = args["path"]
+    # ② cwd 写边界：越界写需确认（bypass 直接放行）
+    if not _path_in_cwd(path) and PERMISSION_MODE != "bypass":
+        if not _confirm(f"编辑工作目录外的文件 {os.path.realpath(path)}", f"edit-outside:{os.path.realpath(path)}"):
+            return "error: 用户拒绝：目标路径在工作目录之外"
     text = open(path).read()
     old, new = args["old"], args["new"]
     if old not in text:
@@ -193,14 +326,21 @@ def glob(args):
 def grep(args):
     """在目录下所有文件中按正则搜索，返回命中的 文件:行号:内容"""
     pattern = re.compile(args["pat"])  # 预编译正则表达式提升效率
+    redact = PERMISSION_MODE != "bypass"  # ④ 非 bypass 下对敏感内容脱敏
     hits = []
     # 递归遍历目录下的所有路径
     for filepath in globlib.glob(args.get("path", ".") + "/**", recursive=True):
+        # ④ 凭证防泄漏：敏感文件整文件跳过（bypass 除外）
+        if redact and _is_secret_path(filepath):
+            continue
         try:
             # 逐行读取（enumerate 从 1 开始计行号），匹配到就记录下来
             for line_num, line in enumerate(open(filepath), 1):
                 if pattern.search(line):
-                    hits.append(f"{filepath}:{line_num}:{line.rstrip()}")
+                    content = line.rstrip()
+                    if redact:  # ④ 行内敏感赋值脱敏
+                        content = _redact_line(content)
+                    hits.append(f"{filepath}:{line_num}:{content}")
         except Exception:
             # 读不了的文件（二进制/目录/无权限等）直接跳过
             pass
@@ -209,8 +349,18 @@ def grep(args):
 
 def bash(args):
     """执行 shell 命令，边执行边实时打印输出，并带 30 秒超时保护"""
+    cmd = args["cmd"]
+    # ① Deny 硬底线：无论何种模式都拦截高危命令
+    why = _deny_check(cmd)
+    if why:
+        print(f"  {RED}⛔ 已拦截高危命令（{why}）{RESET}")
+        return f"error: 命令被安全策略拦截：{why}（硬底线，任何模式都不允许执行）"
+    # ③ 非 bypass 模式下，所有 bash 执行都需确认（可选「不再问本命令」）
+    if PERMISSION_MODE != "bypass":
+        if not _confirm(f"执行命令: {cmd}", f"bash:{cmd}"):
+            return "error: 用户拒绝执行该命令"
     proc = subprocess.Popen(
-        args["cmd"], shell=True,
+        cmd, shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # 把 stderr 合并到 stdout
         text=True
     )
@@ -454,6 +604,10 @@ def render_markdown(text):
 
 def main():
     """程序主入口：实现一个交互式命令行 AI coding 助手"""
+    global PERMISSION_MODE
+    # ③ 启动参数：传入 --bypass 则跳过一切权限校验（危险命令硬底线仍生效）
+    if "--bypass" in sys.argv:
+        PERMISSION_MODE = "bypass"
     # 启动前校验：两种渠道的密钥都没配置则直接报错退出，避免发出无效请求
     if not OPENROUTER_KEY and not ANTHROPIC_API_KEY:
         print(f"{RED}⏺ 未检测到 API 密钥。请先设置环境变量 "
@@ -461,8 +615,23 @@ def main():
         return
     # 打印启动信息：工具名、模型、接入渠道、当前工作目录
     print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}")
-    print(f"{DIM}输入 {CYAN}/help{RESET}{DIM} 查看命令，/ 后按 Tab 可补全{RESET}\n")
+    print(f"{DIM}输入 {CYAN}/help{RESET}{DIM} 查看命令，/ 后按 Tab 可补全{RESET}")
+    # ③ 启动即显示当前权限模式状态条
+    print(_mode_banner())
+    if PERMISSION_MODE == "bypass":
+        print(f"{RED}⚠ 你正运行在 BYPASS 模式，风险自负。{RESET}")
+    print()
     commands.setup_completion(readline)  # 配置命令 Tab 补全与候选中文显示
+    # ③ Shift+Tab（ANSI: \e[Z）尝试绑定到一个 readline 宏，输入 /mode 回车以切换权限模式。
+    # 注意：标准 input() 对控制键支持有限，此为 best-effort；若终端不支持，/mode 命令始终可用。
+    # macOS 自带 libedit，绑定语法与 GNU readline 不同，两种都尝试一遍。
+    try:
+        if "libedit" in (readline.__doc__ or ""):
+            readline.parse_and_bind(r'bind "\e[Z" "/mode\n"')
+        else:
+            readline.parse_and_bind(r'"\e[Z": "/mode\n"')
+    except Exception:
+        pass
     messages = []  # 对话历史，贯穿整个会话
     session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
     # 系统提示：先给 agent 一个明确身份（汽车团队的工作流「小强」），
@@ -505,6 +674,15 @@ def main():
                 continue                      # 空输入则跳过
             if user_input in ("/q", "exit"):
                 break                         # 退出程序
+            if user_input == "/mode":
+                # ③ 切换权限模式：default ↔ bypass（Shift+Tab 已绑定发送该命令）
+                PERMISSION_MODE = "bypass" if PERMISSION_MODE == "default" else "default"
+                print(_mode_banner())
+                if PERMISSION_MODE == "bypass":
+                    print(f"{RED}⚠ 已切到 BYPASS 模式：跳过边界与确认，风险自负。{RESET}")
+                else:
+                    print(f"{GREEN}⏺ 已切回 DEFAULT 模式：越界写入/执行命令将要求确认。{RESET}")
+                continue
             if commands.is_help(user_input):
                 # /help、-h、--help 都显示命令帮助
                 print(commands.format_help({
