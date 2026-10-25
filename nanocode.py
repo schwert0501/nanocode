@@ -14,6 +14,8 @@ except ImportError:
 import session
 # 命令元数据与 Tab 补全：命令表 + /help + 候选中文显示，详见 commands.py
 import commands
+# 上下文自动压缩：历史过长时把较早消息压成摘要，详见 compact.py
+import compact
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -245,6 +247,23 @@ def call_api(messages, system_prompt):
     return json.loads(response.read())          # 读取并解析 JSON 响应
 
 
+def summarize_history(head_messages, system_prompt):
+    """把一段较早的历史消息交给模型压成一段纯文字摘要，供 compact 模块替换原文。
+
+    复用同一个 call_api 通道：临时追加一条指令，让模型输出结构化要点。
+    返回摘要字符串；取不到文本则返回空串（compact 会据此安全跳过）。
+    """
+    instruction = {
+        "role": "user",
+        "content": "请把以上对话压缩成一段简洁但信息完整的要点摘要，"
+        "覆盖：用户的目标与需求、已做出的关键决定、已完成/修改的文件与改动、"
+        "尚未完成的事项、以及后续需要的上下文。只输出摘要正文，不要寒暄。",
+    }
+    resp = call_api(head_messages + [instruction], system_prompt)
+    texts = [b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"]
+    return "\n".join(t for t in texts if t)
+
+
 def separator():
     """生成一条分隔线，宽度取终端宽度与 80 中的较小值"""
     return f"{DIM}{'─' * min(os.get_terminal_size().columns, 80)}{RESET}"
@@ -294,6 +313,28 @@ def main():
                 session_id = session.new_session_id()  # 清空后开启一个全新会话
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
                 continue
+            if user_input == "/compact":
+                # 手动触发压缩：无视阈值，强制把较早历史压成摘要
+                if len(messages) <= 1:
+                    print(f"{DIM}⏺ 历史太短，无需压缩{RESET}")
+                    continue
+                new_messages, info = compact.maybe_compact(
+                    messages,
+                    lambda head: summarize_history(head, system_prompt),
+                    MODEL,
+                    force=True,
+                )
+                if info:
+                    messages = new_messages
+                    session.save_session(session_id, messages)
+                    print(
+                        f"{GREEN}⏺ 已压缩："
+                        f"{info['msgs_before']}→{info['msgs_after']} 条消息，"
+                        f"约 {info['chars_before']}→{info['chars_after']} 字符{RESET}"
+                    )
+                else:
+                    print(f"{DIM}⏺ 暂无可压缩的早期历史{RESET}")
+                continue
             if user_input == "/sessions":
                 # 列出历史会话，供用户选择恢复
                 sessions = session.list_sessions()
@@ -325,6 +366,18 @@ def main():
 
             # agentic loop（智能体循环）：持续调用 API，直到模型不再请求调用工具
             while True:
+                # 调用前检查上下文体量，过长则自动压缩较早历史（保留最近几轮原文）
+                messages, compact_info = compact.maybe_compact(
+                    messages,
+                    lambda head: summarize_history(head, system_prompt),
+                    MODEL,
+                )
+                if compact_info:
+                    print(
+                        f"{DIM}⏺ 上下文已自动压缩："
+                        f"{compact_info['msgs_before']}→{compact_info['msgs_after']} 条消息，"
+                        f"约 {compact_info['chars_before']}→{compact_info['chars_after']} 字符{RESET}"
+                    )
                 response = call_api(messages, system_prompt)
                 content_blocks = response.get("content", [])  # 模型返回的内容块
                 tool_results = []                             # 收集本轮工具执行结果
