@@ -14,7 +14,13 @@ __pycache__/
 # nanocode 运行时生成的文件改动记录（本地审计用，不入库）
 .nanocode_changes/
 
+# 知识缺口记录（运行时收集的"知识库未覆盖问题"，含对话片段，本地/上传两用，不入库）
+.nanocode_gaps/
+
 # 领域知识库索引（.nanocode_kb/）是"构建期生成、随分发包携带"的制品：
 # 开发仓库里不入库（避免把测试语料/大体积索引提交进来），
 # 打包分发时由打包脚本针对正式语料现场 /kb index 生成后一并 include。
 .nanocode_kb/
+
+# macOS 系统文件
+.DS_Store

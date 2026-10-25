@@ -29,6 +29,10 @@ import compact
 import kb
 # 内置技能（SKILL）：领域专用的提示词/标准流程，清单常驻、正文按需加载，详见 skills.py
 import skills
+# agent 身份与领域本体：从 AGENTS.md 解析身份/术语表/协作约定注入 system_prompt，详见 agent_config.py
+import agent_config
+# 知识缺口记录：知识库也查不到时登记缺口（可选上传对象存储），供持续完善 agent，详见 gaps.py
+import gaps
 
 # 配置日志：输出时间、级别、信息，默认 INFO 级别
 logging.basicConfig(
@@ -355,9 +359,10 @@ def bash(args):
     if why:
         print(f"  {RED}⛔ 已拦截高危命令（{why}）{RESET}")
         return f"error: 命令被安全策略拦截：{why}（硬底线，任何模式都不允许执行）"
-    # ③ 非 bypass 模式下，所有 bash 执行都需确认（可选「不再问本命令」）
+    # ③ 非 bypass 模式下，bash 执行需确认；按 a 则本会话所有 bash 都放行
+    #    （签名用固定类别 bash:* 而非具体命令，故一次 a 之后不再逐条询问）
     if PERMISSION_MODE != "bypass":
-        if not _confirm(f"执行命令: {cmd}", f"bash:{cmd}"):
+        if not _confirm(f"执行命令: {cmd}", "bash:*"):
             return "error: 用户拒绝执行该命令"
     proc = subprocess.Popen(
         cmd, shell=True,
@@ -429,6 +434,13 @@ TOOLS = {
         "FIRST to load the standard steps, then follow them.",
         {"name": "string"},
         skills.skill_use,
+    ),
+    "record_gap": (
+        "Record a knowledge gap when kb_search cannot find info the user needs. "
+        "Call this ONLY after kb_search returned nothing useful, to log the "
+        "uncovered question for later improvement of the knowledge base.",
+        {"question": "string", "context": "string?", "note": "string?"},
+        gaps.record_gap,
     ),
 }
 
@@ -634,14 +646,14 @@ def main():
         pass
     messages = []  # 对话历史，贯穿整个会话
     session_id = session.new_session_id()  # 本次会话的 id，用于自动保存
-    # 系统提示：先给 agent 一个明确身份（汽车团队的工作流「小强」），
+    # 系统提示：身份与领域本体从 AGENTS.md 读取（唯一事实来源，改身份只改 md），
     # 再按需拼接知识库 / SKILL 的使用引导。
-    system_prompt = (
-        "你是「小强」，汽车团队的工作流助手，专门负责算子（suanzi）开发"
-        "和数据分析相关的工作。你熟悉团队的开发规范与取数/分析流程，"
-        "回答与动手时优先遵循团队沉淀的标准做法，保持简洁高效。\n"
-        f"Concise coding assistant. cwd: {os.getcwd()}"
-    )
+    agent_prompt = agent_config.load_prompt()
+    if agent_prompt:
+        system_prompt = f"{agent_prompt}\n\ncwd: {os.getcwd()}"
+    else:
+        # AGENTS.md 缺失时的兜底提示，保证程序仍可用
+        system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
     # 若已内置领域知识库，提示模型优先检索，避免凭空作答
     if kb.stat().get("built"):
         system_prompt += (
