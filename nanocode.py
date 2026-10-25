@@ -2,7 +2,7 @@
 """nanocode - minimal claude code alternative"""
 
 # glob 和内置的 glob 工具函数重名，所以用 globlib 别名导入标准库
-import glob as globlib, json, logging, os, re, subprocess, urllib.request
+import difflib, glob as globlib, json, logging, os, re, subprocess, urllib.request
 
 # 仅导入即可让 input() 启用 readline 行编辑（左右移动、退格重绘更正常）
 try:
@@ -12,6 +12,8 @@ except ImportError:
 
 # 会话持久化：存/读/列历史会话，详见 session.py
 import session
+# 改动记录：记录每次文件写入/编辑的全量快照，支持审计与回滚，详见 changelog.py
+import changelog
 # 命令元数据与 Tab 补全：命令表 + /help + 候选中文显示，详见 commands.py
 import commands
 # 上下文自动压缩：历史过长时把较早消息压成摘要，详见 compact.py
@@ -56,6 +58,68 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 # 下面这些函数就是 AI 可以调用的“工具”，每个接收一个 dict 形式的 args 参数，返回字符串结果
 
 
+def _read_if_exists(path):
+    """读取文件内容；文件不存在或读失败则返回 None（None 代表“新建”）"""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _show_and_record(tool, path, before, after):
+    """核心审计函数：对比改动前后内容，打印彩色 diff + 增删行数摘要，并记账。
+
+    - 增行用绿色、减行用红色，仿 git diff 风格，让用户一眼看清这轮改了什么。
+    - 统计净增/净减行数，打印形如 "file.py  +12 -3" 的摘要。
+    - 调用 changelog 把全量快照落盘，为审计与回滚提供依据。
+    内容无变化时不打印 diff、也不记账，避免噪音。
+    """
+    old_text = before or ""
+    new_text = after or ""
+    if old_text == new_text:
+        return  # 无实际变化，跳过
+
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+
+    # 用 difflib 生成 unified diff（标准库，零依赖），逐行着色打印
+    added = removed = 0
+    diff_lines = []
+    for line in difflib.unified_diff(old_lines, new_lines, lineterm=""):
+        # 跳过文件头（--- / +++）和块头（@@），只展示增删内容更清爽
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("@@"):
+            diff_lines.append(f"  {DIM}{line}{RESET}")
+            continue
+        if line.startswith("+"):
+            added += 1
+            diff_lines.append(f"  {GREEN}{line.rstrip(chr(10))}{RESET}")
+        elif line.startswith("-"):
+            removed += 1
+            diff_lines.append(f"  {RED}{line.rstrip(chr(10))}{RESET}")
+
+    rel = os.path.relpath(path)
+    tag = "新建" if before is None else "修改"
+    # 打印摘要行：文件名 + 绿色 +N + 红色 -M
+    print(
+        f"  {DIM}⎿{RESET} {tag} {BOLD}{rel}{RESET}  "
+        f"{GREEN}+{added}{RESET} {RED}-{removed}{RESET}"
+    )
+    # 打印具体 diff（内容较多时最多展示前 40 行，避免刷屏）
+    for dl in diff_lines[:40]:
+        print(dl)
+    if len(diff_lines) > 40:
+        print(f"  {DIM}... 省略 {len(diff_lines) - 40} 行 diff{RESET}")
+
+    # 记账：保存全量快照，返回编号并提示用户可用于回滚
+    number = changelog.record_change(tool, path, before, after)
+    print(f"  {DIM}改动 #{number} 已记录，可用 /revert {number} 回滚{RESET}")
+
+
 def read(args):
     """读取文件内容，并在每行前面加上行号（方便 AI 定位代码位置）"""
     lines = open(args["path"]).readlines()
@@ -67,15 +131,23 @@ def read(args):
 
 
 def write(args):
-    """把内容整体写入文件（覆盖写），返回 ok 表示成功"""
-    with open(args["path"], "w") as f:
-        f.write(args["content"])
+    """把内容整体写入文件（覆盖写），返回 ok 表示成功。
+
+    写入前先读旧内容，用于生成彩色 diff 并记账，便于审计与回滚。
+    """
+    path = args["path"]
+    before = _read_if_exists(path)          # 旧内容；None 表示新建文件
+    after = args["content"]
+    with open(path, "w") as f:
+        f.write(after)
+    _show_and_record("write", path, before, after)  # 打印 diff + 记账
     return "ok"
 
 
 def edit(args):
     """在文件中把 old 字符串替换为 new 字符串，实现精确编辑"""
-    text = open(args["path"]).read()
+    path = args["path"]
+    text = open(path).read()
     old, new = args["old"], args["new"]
     if old not in text:
         return "error: old_string not found"      # 找不到待替换内容则报错
@@ -87,8 +159,9 @@ def edit(args):
     replacement = (
         text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
     )
-    with open(args["path"], "w") as f:
+    with open(path, "w") as f:
         f.write(replacement)
+    _show_and_record("edit", path, text, replacement)  # 打印 diff + 记账
     return "ok"
 
 
@@ -223,8 +296,18 @@ def make_schema():
     return result
 
 
-def call_api(messages, system_prompt):
-    """向大模型 API 发起一次请求，带上对话历史、系统提示和工具 schema，返回解析后的 JSON"""
+def call_api(messages, system_prompt, live=False):
+    """向大模型 API 发起一次请求，返回与原先等价的解析结果 {"content": [...]}。
+
+    采用流式（SSE）协议：请求体带 "stream": true，服务端会把一条回复拆成
+    一串增量事件逐步推送。本函数边收边处理：
+      - live=True 时，文本增量实时打印到终端（边想边说，不再整段阻塞）；
+      - 同时把所有增量重新拼装成与非流式响应等价的 content_blocks，
+        使外层 agentic loop、summarize_history 等调用方完全无需改动。
+
+    参数 live：是否把文本增量实时回显到终端。主循环传 True（给用户看），
+    summarize_history 等后台调用传 False（只取结果，不打印）。
+    """
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(
@@ -234,6 +317,7 @@ def call_api(messages, system_prompt):
                 "system": system_prompt,
                 "messages": messages,
                 "tools": make_schema(),
+                "stream": True,            # 开启流式：服务端用 SSE 持续推送增量
             }
         ).encode(),
         headers={
@@ -243,8 +327,78 @@ def call_api(messages, system_prompt):
             **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": ANTHROPIC_API_KEY}),
         },
     )
-    response = urllib.request.urlopen(request)  # 发送请求
-    return json.loads(response.read())          # 读取并解析 JSON 响应
+    response = urllib.request.urlopen(request)
+
+    # blocks[index] 保存正在拼装的内容块；按服务端给的 index 定位，
+    # text 块累积 text 片段，tool_use 块累积 input 的 JSON 字符串片段
+    blocks = {}
+    printed_prefix = False   # live 模式下是否已打印过 "⏺ " 前缀（整段文本只打一次）
+
+    # 逐行读取 SSE 流。SSE 以文本行推送，我们只关心 "data: {...}" 这类数据行
+    for raw in response:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line or not line.startswith("data:"):
+            continue                       # 跳过空行、event: 行等非数据行
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break                          # 兼容部分渠道用 [DONE] 收尾
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue                       # 非法 JSON 直接跳过，保证健壮
+        etype = event.get("type")
+
+        if etype == "content_block_start":
+            # 新内容块开始：按类型初始化一个待拼装的壳
+            idx = event["index"]
+            cb = event.get("content_block", {})
+            if cb.get("type") == "text":
+                blocks[idx] = {"type": "text", "text": ""}
+            elif cb.get("type") == "tool_use":
+                blocks[idx] = {
+                    "type": "tool_use",
+                    "id": cb.get("id"),
+                    "name": cb.get("name"),
+                    "input": "",           # 先用字符串累积 JSON 片段，结束时再 parse
+                }
+
+        elif etype == "content_block_delta":
+            # 内容块增量：文本或 tool_use 的 JSON 片段
+            idx = event["index"]
+            delta = event.get("delta", {})
+            if delta.get("type") == "text_delta":
+                piece = delta.get("text", "")
+                if idx in blocks:
+                    blocks[idx]["text"] += piece
+                if live and piece:
+                    # 文本流式回显：首个片段前打印 "⏺ " 前缀
+                    if not printed_prefix:
+                        print(f"\n{CYAN}⏺{RESET} ", end="", flush=True)
+                        printed_prefix = True
+                    print(piece, end="", flush=True)
+            elif delta.get("type") == "input_json_delta":
+                if idx in blocks:
+                    blocks[idx]["input"] += delta.get("partial_json", "")
+
+        elif etype == "message_stop":
+            break                          # 本条消息结束
+
+    if live and printed_prefix:
+        print(flush=True)                  # 流式文本后补一个换行，收尾排版
+
+    # 把 tool_use 块累积的 JSON 字符串解析回 dict，重建成与非流式等价的结构
+    content_blocks = []
+    for idx in sorted(blocks):
+        block = blocks[idx]
+        if block["type"] == "tool_use":
+            raw_input = block["input"]
+            try:
+                block["input"] = json.loads(raw_input) if raw_input else {}
+            except json.JSONDecodeError:
+                block["input"] = {}
+        content_blocks.append(block)
+
+    return {"content": content_blocks}
 
 
 def summarize_history(head_messages, system_prompt):
@@ -361,6 +515,52 @@ def main():
                 messages = session.load_session(session_id)
                 print(f"{GREEN}⏺ 已恢复会话 {session_id}（{len(messages)} 条消息）{RESET}")
                 continue
+            if user_input == "/changes":
+                # 列出所有文件改动记录，供审计
+                entries = changelog.list_changes()
+                if not entries:
+                    print(f"{DIM}暂无改动记录{RESET}")
+                else:
+                    print(f"{BOLD}改动记录{RESET}（用 {CYAN}/revert <编号>{RESET} 回滚）:")
+                    for e in entries:
+                        # 统计这条记录的增删行数，给人一个直观的改动量
+                        before = (e.get("before") or "").splitlines()
+                        after = (e.get("after") or "").splitlines()
+                        diff = difflib.unified_diff(before, after, lineterm="")
+                        added = removed = 0
+                        for line in diff:
+                            if line.startswith("+") and not line.startswith("+++"):
+                                added += 1
+                            elif line.startswith("-") and not line.startswith("---"):
+                                removed += 1
+                        rel = os.path.relpath(e["path"])
+                        print(
+                            f"  {BOLD}#{e['number']}{RESET} {DIM}{e['time']}{RESET} "
+                            f"[{e['tool']}] {rel}  "
+                            f"{GREEN}+{added}{RESET} {RED}-{removed}{RESET}"
+                        )
+                continue
+            if user_input == "/undo":
+                # 撤销最近一次改动：回滚编号最大的那条记录
+                entries = changelog.list_changes()
+                if not entries:
+                    print(f"{DIM}暂无可撤销的改动{RESET}")
+                    continue
+                result = changelog.revert_change(entries[-1]["number"])
+                color = GREEN if result["ok"] else RED
+                print(f"{color}⏺ {result['msg']}{RESET}")
+                continue
+            if user_input.startswith("/revert"):
+                # 回滚指定编号的改动
+                parts = user_input.split()
+                if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
+                    print(f"{YELLOW}用法: /revert <编号>，先用 /changes 查看编号{RESET}")
+                    continue
+                number = int(parts[1].lstrip("#"))
+                result = changelog.revert_change(number)
+                color = GREEN if result["ok"] else RED
+                print(f"{color}⏺ {result['msg']}{RESET}")
+                continue
 
             messages.append({"role": "user", "content": user_input})
 
@@ -378,14 +578,12 @@ def main():
                         f"{compact_info['msgs_before']}→{compact_info['msgs_after']} 条消息，"
                         f"约 {compact_info['chars_before']}→{compact_info['chars_after']} 字符{RESET}"
                     )
-                response = call_api(messages, system_prompt)
+                response = call_api(messages, system_prompt, live=True)
                 content_blocks = response.get("content", [])  # 模型返回的内容块
                 tool_results = []                             # 收集本轮工具执行结果
 
                 for block in content_blocks:
-                    # 文本块：直接渲染并打印给用户
-                    if block["type"] == "text":
-                        print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
+                    # 文本块：流式模式下 call_api 已实时打印过，这里不再重复输出
 
                     # 工具调用块：执行对应工具
                     if block["type"] == "tool_use":
