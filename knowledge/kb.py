@@ -10,11 +10,12 @@
 - 两期检索后端（通过 config.json 的 backend 字段切换）：
   * 第一期 bm25（默认）：稀疏/关键词检索，只数词频，用标准库 collections+math 手写
     约几十行即可，零依赖、不联网、解压即用。适合关键词/专有名词/代码符号精确命中。
-  * 第二期 vector / hybrid（可选，方案 A）：本地 embedding 模型做稠密/语义检索，
-    "换一种说法也能召回"。模型侧依赖全部收口在 embedding.py（sentence-transformers，
-    首次使用自动下载小型本地模型到 ~/.cache）。hybrid 用 RRF 融合 BM25 与向量结果。
-  * 关键回退：向量后端需要第三方库；没装库时本模块自动降级到 bm25，保证"解压即用"
-    的 BM25 路径永不受影响（见 _resolve_backend / search）。
+  * 第二期 vector / hybrid（可选，方案 A）：静态词向量做稠密/语义检索，
+    "换一种说法也能召回"。模型侧全部收口在 embedding.py / static_vec.py：向量资产
+    （约 14MB）随包放在 knowledge/assets/，零下载零联网，唯一可选依赖是 numpy。
+    hybrid 用 RRF 融合 BM25 与向量结果。
+  * 关键回退：向量后端需要 numpy 与资产文件；任一缺失时本模块自动降级到 bm25，
+    保证"解压即用"的 BM25 路径永不受影响（见 _resolve_backend / search）。
 
 - 构建期 vs 运行期（分发关键）：
   * 构建期：知识库作者在本机运行 `/kb index <目录>`，把语料切块+建索引，
@@ -54,7 +55,7 @@ SOURCES_FILE = os.path.join(KB_DIR, "sources.json")
 VECTORS_FILE = os.path.join(KB_DIR, "vectors.jsonl")
 
 # 检索后端：bm25（默认，零依赖）/ vector（纯语义）/ hybrid（BM25+向量 RRF 融合）。
-# 默认仍是 bm25，保证"解压即用"路径不变；向量后端需装 sentence-transformers（见 embedding.py）。
+# 默认仍是 bm25，保证"解压即用"路径不变；向量后端需要可选依赖 numpy（见 embedding.py）。
 DEFAULT_BACKEND = "bm25"
 VALID_BACKENDS = ("bm25", "vector", "hybrid")
 # hybrid 融合用的 RRF 常数：名次 r 的贡献为 1/(RRF_K + r)，K 越大越平滑。
@@ -319,7 +320,7 @@ def build_index(root, append=False, backend=None):
     _save_chunks(all_chunks)
     _save_sources(sources)
 
-    # vector/hybrid：编码全部片段向量并落盘。装库失败/未装库时回退 bm25 并给出原因。
+    # vector/hybrid：编码全部片段向量并落盘。依赖/资产缺失或编码失败时回退 bm25 并给出原因。
     n_vectors = 0
     emb_model = None
     emb_dim = None
@@ -328,7 +329,7 @@ def build_index(root, append=False, backend=None):
     if backend in ("vector", "hybrid"):
         if not embedding.available():
             effective_backend = "bm25"
-            vector_note = "（未安装 sentence-transformers，已回退 bm25；运行 /kb model 查看安装方法）"
+            vector_note = "（向量编码不可用，已回退 bm25；运行 /kb model 查看原因与解决方法）"
         else:
             try:
                 vecs = embedding.encode_docs([c["text"] for c in all_chunks])
@@ -589,6 +590,8 @@ def _vector_search(query, k):
     """语义向量检索：编码查询后与各片段向量算点积（均 L2 归一化=余弦），取 top-k。
 
     返回 [(cosine, doc_id), ...]（降序）。向量缺失或编码失败时返回空。
+    片段上千条时纯 Python 双层循环会到百毫秒级，故优先走 numpy 矩阵乘，
+    numpy 不可用时回退纯 Python（功能等价，只是慢）。
     """
     vectors = _load_vectors()
     if not vectors:
@@ -597,10 +600,25 @@ def _vector_search(query, k):
         qv = embedding.encode_query(query)
     except Exception:
         return []
+    dim = len(qv)
+    doc_ids = [d for d, v in vectors.items() if len(v) == dim]
+    if not doc_ids:
+        return []
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+    if np is not None:
+        matrix = np.asarray([vectors[d] for d in doc_ids], dtype=np.float32)
+        scores = matrix @ np.asarray(qv, dtype=np.float32)
+        top = min(k, len(doc_ids))
+        # argpartition 只做 top-k 部分排序，比全量 sort 更省；再对这 k 个精排
+        idx = np.argpartition(-scores, top - 1)[:top]
+        idx = idx[np.argsort(-scores[idx])]
+        return [(float(scores[i]), doc_ids[i]) for i in idx]
     scored = []
-    for doc_id, vec in vectors.items():
-        if len(vec) != len(qv):
-            continue
+    for doc_id in doc_ids:
+        vec = vectors[doc_id]
         dot = 0.0
         for a, b in zip(qv, vec):
             dot += a * b
@@ -743,6 +761,6 @@ def cmd_stat():
 
 
 def cmd_model():
-    """/kb model 的后端：主动加载/下载 embedding 模型并返回状态。"""
+    """/kb model 的后端：主动加载向量资产并返回状态（无需联网下载）。"""
     res = embedding.ensure_model()
     return {"ok": res["ok"], "msg": res["msg"]}

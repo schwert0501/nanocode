@@ -4,145 +4,76 @@
 这是什么 / 为什么独立成模块：
 - 第一期的 BM25（见 kb.py）是纯标准库的关键词检索，零依赖、解压即用。第二期要
   加「语义检索」：把片段与查询都编码成向量，用余弦相似度召回「换一种说法也能命中」
-  的内容。向量能力需要一个 embedding 模型，这打破了「仅标准库」这条线，因此把所有
-  第三方依赖与模型加载逻辑全部收口到本模块，kb.py 只在需要时才 import 它。
+  的内容。本模块是 kb.py 与底层编码引擎之间的唯一接口层，kb.py 只在需要时才
+  import 它，向量路径的任何不可用都在这里收口成「优雅降级」。
 
-- 依赖取舍（用户已拍板方案 A）：用 sentence-transformers 加载一个小型本地 embedding
-  模型（默认 BAAI/bge-small-zh-v1.5，约 95MB），首次使用时自动从 HuggingFace 下载到
-  本机缓存（~/.cache/huggingface，不进项目目录）。装了库 → 向量/hybrid 后端可用；
-  没装库 → kb.py 优雅回退到 BM25，保证「解压即用」的 BM25 路径永远不受影响。
+- 依赖取舍（用户已拍板）：不用 sentence-transformers（会拖进 torch，几百 MB 到 1GB+，
+  且模型要联网下载到 ~/.cache/huggingface，与「解压即用」冲突）。改用随包分发的
+  静态词向量资产（见 static_vec.py，约 14MB，放在 knowledge/assets/）：
+      * 唯一第三方依赖是 numpy，且是可选的；
+      * 零网络请求、零模型下载，拿到 zip 就能用；
+      * numpy 缺失或资产缺失 -> available() 为假 -> kb.py 自动回退 BM25。
 
-- 模型可换：通过环境变量 NANOCODE_EMBED_MODEL 覆盖默认模型名。bge 系列中文检索需要
-  给 query 加指令前缀，这里按模型名自动处理（见 _query_instruction）。
+- 与静态词向量的接口差异：静态词向量是对称编码（query 与 doc 走同一套管道），
+  不存在 bge 系列那种「query 侧加指令前缀」的非对称检索约定，因此本模块不再有
+  指令前缀逻辑；encode_docs 与 encode_query 共用同一编码路径。
 
-对外接口：
-  available()            -> 第三方依赖是否就绪（bool）
-  install_hint()         -> 未就绪时给用户看的安装提示文本
-  model_name()           -> 当前使用的模型名
+对外接口（签名与第一版保持一致，kb.py 无需关心底层换没换）：
+  available()            -> 编码能力是否就绪（bool）
+  install_hint()         -> 未就绪时给用户看的提示文本
+  model_name()           -> 当前使用的模型标识
   encode_docs(texts)     -> 批量编码文档，返回 [[float,...], ...]（已 L2 归一化）
-  encode_query(text)     -> 编码单条查询，返回 [float,...]（已 L2 归一化，含 bge 指令前缀）
-  ensure_model()         -> 触发一次模型加载/下载，返回 {ok, msg, model, dim}
-  dim()                  -> 向量维度（加载后才知道）
+  encode_query(text)     -> 编码单条查询，返回 [float,...]（已 L2 归一化）
+  ensure_model()         -> 触发一次资产加载，返回 {ok, msg, model, dim}
+  dim()                  -> 向量维度
 """
 
-import os
-
-# 默认模型：中文文档检索友好、体积小（~95MB）。可用环境变量覆盖。
-DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
-
-# bge 中文检索约定：query 侧需加指令前缀，doc 侧不加（显著提升非对称检索效果）。
-_BGE_ZH_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
-_BGE_EN_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-
-# 进程内缓存已加载的模型，避免每次检索都重载（模型加载是秒级开销）。
-_MODEL = None
-_DIM = None
+from . import static_vec
 
 
 def model_name():
-    """当前使用的 embedding 模型名（环境变量优先）。"""
-    return os.environ.get("NANOCODE_EMBED_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    """当前使用的 embedding 模型标识（随包静态资产，无可配置项）。"""
+    return static_vec.model_name()
 
 
 def available():
-    """第三方依赖（sentence-transformers）是否可用。不触发模型下载，仅探测 import。"""
-    try:
-        import sentence_transformers  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """编码能力是否可用（numpy 已装 + 资产完整）。不触发加载，仅做探测。"""
+    return static_vec.available()
 
 
 def install_hint():
-    """未就绪时给用户看的安装提示。"""
-    return (
-        "向量/hybrid 后端需要 sentence-transformers（会顺带装 torch）。安装：\n"
-        "    pip install sentence-transformers\n"
-        "装好后运行 /kb model 预下载模型，或直接 /kb index <目录> --backend hybrid。\n"
-        "未安装时知识库自动使用零依赖的 BM25 后端。"
-    )
-
-
-def _load():
-    """懒加载模型（首次调用会触发 HuggingFace 自动下载到 ~/.cache）。"""
-    global _MODEL, _DIM
-    if _MODEL is not None:
-        return _MODEL
-    from sentence_transformers import SentenceTransformer
-    name = model_name()
-    _MODEL = SentenceTransformer(name)
-    try:
-        _DIM = int(_MODEL.get_sentence_embedding_dimension())
-    except Exception:
-        _DIM = None
-    return _MODEL
+    """未就绪时给用户看的提示（区分缺 numpy / 缺资产两种原因）。"""
+    return static_vec.install_hint()
 
 
 def dim():
-    """向量维度；未加载过模型时返回 None。"""
-    return _DIM
-
-
-def _query_instruction(name):
-    """按模型名返回 query 侧指令前缀（非 bge 模型返回空串）。"""
-    low = name.lower()
-    if "bge" in low:
-        if "-zh" in low or "zh-" in low or low.endswith("-zh"):
-            return _BGE_ZH_QUERY_INSTRUCTION
-        return _BGE_EN_QUERY_INSTRUCTION
-    return ""
-
-
-def _to_list(vectors):
-    """把模型输出（numpy / tensor）统一转成纯 Python list，便于 JSON 落盘。"""
-    try:
-        return vectors.tolist()
-    except AttributeError:
-        return [list(v) for v in vectors]
+    """向量维度；静态资产维度固定，无需加载即可返回。"""
+    return static_vec.dim()
 
 
 def encode_docs(texts, batch_size=32):
-    """批量编码文档片段，返回已 L2 归一化的向量列表（与输入顺序一一对应）。"""
-    model = _load()
-    vecs = model.encode(
-        list(texts),
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-    return _to_list(vecs)
+    """批量编码文档片段，返回已 L2 归一化的向量列表（与输入顺序一一对应）。
+
+    batch_size 参数保留以兼容调用方签名：静态词向量是逐条查表求均值，
+    没有需要分批的显存/批处理开销，故此处忽略该参数。
+    """
+    return static_vec.encode(list(texts))
 
 
 def encode_query(text):
-    """编码单条查询：自动加 bge 指令前缀、L2 归一化，返回一维向量 list。"""
-    model = _load()
-    prefix = _query_instruction(model_name())
-    vec = model.encode(
-        [prefix + text],
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-    return _to_list(vec)[0]
+    """编码单条查询，返回一维向量 list（已 L2 归一化）。
+
+    静态词向量是对称编码，query 与 doc 走完全相同的管道，不加任何指令前缀。
+    """
+    return static_vec.encode([text])[0]
 
 
 def ensure_model():
-    """主动触发一次模型加载/下载（供 /kb model 预热用）。返回状态 dict。"""
+    """主动触发一次资产加载（供 /kb model 预热用）。返回状态 dict。"""
     if not available():
-        return {"ok": False, "msg": install_hint(), "model": model_name(), "dim": None}
-    try:
-        encode_query("预热")
-        return {
-            "ok": True,
-            "msg": f"模型就绪：{model_name()}（维度 {dim()}，缓存于 ~/.cache/huggingface）",
-            "model": model_name(),
-            "dim": dim(),
-        }
-    except Exception as err:
-        return {
-            "ok": False,
-            "msg": f"模型加载失败：{err}\n{install_hint()}",
-            "model": model_name(),
-            "dim": None,
-        }
+        return {"ok": False, "msg": install_hint(), "model": model_name(), "dim": dim()}
+    ok, msg = static_vec.warmup()
+    if not ok:
+        return {"ok": False, "msg": f"{msg}\n{install_hint()}",
+                "model": model_name(), "dim": None}
+    return {"ok": True, "msg": msg, "model": model_name(), "dim": dim()}
