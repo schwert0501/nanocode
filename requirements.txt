@@ -19,14 +19,41 @@
 # numpy>=1.20
 
 # -----------------------------------------------------------------------------
-# 对象存储上传（知识缺口 → BOS problem/）同样**不需要**任何第三方依赖。
+# 对象存储上传（知识缺口 → BOS problem/）同样**不需要**任何第三方 Python 依赖。
 #
-# 不用 minio / boto3 的原因：百度 BOS 不接受 AWS SigV4 签名
-# （实测向 <bucket>.bj.bcebos.com 发 SigV4 请求返回
-#  400 MissingDateHeader，要求 date / x-bce-date 头），
-# 它用的是自家 bce-auth-v1 协议。该协议只需 hmac + hashlib + urllib，
-# 标准库完全够用，已在 knowledge/bos.py 中实现。
+# 共有三条通道，按优先级降级：mc → bos.py → 自建端点。
+#
+# 通道一：MinIO 客户端 mc（knowledge/mc_client.py，首选）
+#   mc 是单个静态二进制，拷过去就能跑，Python 侧零依赖、跨 mac/linux 迁移。
+#   只支持 darwin/linux × amd64/arm64（Windows 不在支持范围内）。
+#   定位顺序：NANOCODE_MC_PATH > 系统 PATH 里的 mc > ~/.nanocode/bin 缓存 >
+#   按平台从 GitHub Release 下载并做 sha256 强校验后缓存（约 30MB，仅一次）。
+#
+#   重要：mc 打 BOS 必须走 **S3 兼容端点** s3.<region>.bcebos.com。
+#   原生端点 bj.bcebos.com 只认百度自家 bce-auth-v1，用 SigV4 打它会返回
+#   MissingDateHeader；mc_client 会自动把配置里的 endpoint 加上 s3. 前缀
+#   （可用 BOS_S3_ENDPOINT 显式覆盖），所以用户配置无需改动。
+#
+#   风险提示：MinIO 已归档开源的 mc/Server，dl.min.io 现返回 410 Gone，
+#   不再有新版本与安全更新。故这里固定 RELEASE.2025-08-13T08-35-41Z 并校验
+#   sha256，同时保留通道二作为永久可用的纯标准库回退。
+#
+# 通道二：BOS 原生签名（knowledge/bos.py，回退）
+#   纯标准库实现 bce-auth-v1（hmac + hashlib + urllib），不依赖任何外部
+#   二进制与网络下载，在 mc 不可用（平台不支持 / 离线 / 下载失败）时接管。
+#   这也是为什么没有引入 minio / boto3：标准库已经够用。
+#
+# 通道三：自建接收端点
+#   设置 GAP_UPLOAD_URL（可选 GAP_UPLOAD_AUTH）即启用，适合不想把密钥
+#   下发到客户端的场景。
 #
 # 配置方式：复制 .nanocode_bos.json.example 为 .nanocode_bos.json 填入 AK/SK
 # （该文件已在 .gitignore 中），或导出 BOS_ACCESS_KEY / BOS_SECRET_KEY /
-# BOS_BUCKET / BOS_ENDPOINT 环境变量。不配置则缺口记录纯本地，零外部调用。
+# BOS_BUCKET / BOS_ENDPOINT 环境变量。通道一、二共用这同一份凭据。
+# 三条通道全未配置则缺口记录纯本地，零外部调用。
+#
+# 相关环境变量：
+#   NANOCODE_MC_PATH            指定 mc 可执行文件路径（最高优先级）
+#   NANOCODE_BIN_DIR            mc 缓存目录，默认 ~/.nanocode/bin
+#   NANOCODE_MC_AUTO_DOWNLOAD   设为 0 禁止自动下载（离线/受控环境）
+#   BOS_S3_ENDPOINT             显式指定 mc 使用的 S3 兼容端点

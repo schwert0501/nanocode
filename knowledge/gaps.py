@@ -12,14 +12,18 @@
 - 可选对象存储：若配置了凭据（见下），每条缺口同时尝试上传，便于跨用户集中收集。
   上传失败不影响本地记录（best-effort、静默降级）。
 
-对象存储上传支持两种「可选」通道，按优先级尝试，任一成功即算上传成功：
-1. 百度对象存储 BOS（knowledge/bos.py，纯标准库签名）——配置 BOS_ACCESS_KEY /
-   BOS_SECRET_KEY / BOS_BUCKET（或项目根 .nanocode_bos.json）即启用，
-   对象写入 `problem/` 目录下。
-2. 自建接收端点——设置 GAP_UPLOAD_URL 环境变量即启用（HTTP POST 一个 JSON）。
+对象存储上传支持三条「可选」通道，按优先级依次尝试，任一成功即算上传成功：
+1. MinIO 客户端 mc（knowledge/mc_client.py）——复用同一份 BOS 凭据，
+   走 BOS 的 S3 兼容端点 s3.bj.bcebos.com。mc 是单个静态二进制，
+   Python 侧零依赖，可跨 mac / linux 迁移；找不到就自动下载并缓存。
+2. 百度对象存储 BOS 原生签名（knowledge/bos.py，纯标准库 bce-auth-v1）——
+   mc 不可用（平台不支持 / 离线 / 下载失败）时的回退通道，纯标准库，永远能跑。
+3. 自建接收端点——设置 GAP_UPLOAD_URL 环境变量即启用（HTTP POST 一个 JSON）。
    适合不想把密钥放到客户端、而是在中间放一层薄接收服务的场景。
 
-两者都未配置时即纯本地记录，零外部调用。
+1 和 2 共用同一套凭据（BOS_ACCESS_KEY / BOS_SECRET_KEY / BOS_BUCKET
+或项目根 .nanocode_bos.json），对象都写入 `problem/` 目录下。
+全部未配置时即纯本地记录，零外部调用。
 
 隐私提示：缺口内容可能包含用户对话片段。是否上传、上传到哪、保留多久，
 应由团队的数据合规策略决定。默认**不**上传（未配任何凭据即纯本地）。
@@ -30,7 +34,7 @@ import json
 import os
 import urllib.request
 
-from knowledge import bos
+from knowledge import bos, mc_client
 
 # 缺口记录存放在项目根目录 .nanocode_gaps/（与 cwd 无关，便于集中管理）。
 # 本模块位于 knowledge/ 子包，需上溯一层到项目根。
@@ -70,8 +74,22 @@ def _object_key(entry):
     return "%s/%s/gap-%04d-%s.json" % (GAP_PREFIX, day, entry["number"], stamp)
 
 
+def _upload_mc(entry):
+    """通道一：用 MinIO 客户端 mc 上传到 problem/ 目录（首选）。
+
+    优先用 mc 是因为它自带 SigV4 与重试，且可执行文件可随处拷贝；
+    凭据与通道二共用，所以这里只在 mc 真找不到时才让位给 bos.py。
+    返回 (ok, detail)。
+    """
+    conf = mc_client.load_config()
+    if not bos.is_configured(conf):
+        return False, "BOS 未配置"
+    body = json.dumps(entry, ensure_ascii=False, indent=2)
+    return mc_client.put_object(_object_key(entry), body, "application/json", conf)
+
+
 def _upload_bos(entry):
-    """通道一：上传到百度对象存储 BOS 的 problem/ 目录。
+    """通道二：用纯标准库 bce-auth-v1 签名直传 BOS（mc 不可用时的回退）。
 
     返回 (ok, detail)。未配置凭据时返回 (False, 原因)，不视为错误。
     """
@@ -105,12 +123,12 @@ def _upload_endpoint(entry):
 def _try_upload(entry):
     """best-effort 把一条缺口上传到对象存储 / 接收端点。
 
-    依次尝试 BOS、自建端点，任一成功即返回 (True, detail)；
+    依次尝试 mc、BOS 原生签名、自建端点，任一成功即返回 (True, detail)；
     全部未配置或失败则返回 (False, detail)。任何异常都不会外抛——
     上传是副路径，绝不能影响本地记录与主对话流程。
     """
     details = []
-    for upload in (_upload_bos, _upload_endpoint):
+    for upload in (_upload_mc, _upload_bos, _upload_endpoint):
         try:
             ok, detail = upload(entry)
         except Exception as err:
@@ -179,17 +197,22 @@ def list_gaps():
 
 
 def upload_enabled():
-    """是否配置了任一上传通道（BOS 凭据 或 自建端点）"""
-    return bool(bos.is_configured() or GAP_UPLOAD_URL)
+    """是否配置了任一上传通道（mc / BOS 原生签名 / 自建端点）"""
+    return bool(mc_client.is_configured() or bos.is_configured() or GAP_UPLOAD_URL)
 
 
 def stat():
-    """统计信息：{dir, count, upload_enabled, bos_bucket, bos_prefix}"""
+    """统计信息：{dir, count, upload_enabled, bos_bucket, bos_prefix, mc}"""
     conf = bos.load_config()
+    try:
+        mc_status = mc_client.status()
+    except Exception as err:
+        mc_status = {"ready": False, "mc_reason": "%s: %s" % (type(err).__name__, err)}
     return {
         "dir": GAPS_DIR,
         "count": _count(),
         "upload_enabled": upload_enabled(),
         "bos_bucket": conf["bucket"] if bos.is_configured(conf) else "",
         "bos_prefix": GAP_PREFIX + "/",
+        "mc": mc_status,
     }

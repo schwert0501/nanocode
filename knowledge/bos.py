@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """bos - 百度对象存储（BOS）上传客户端，纯标准库实现。
 
+定位：知识缺口上传的**回退通道**。首选通道是 knowledge/mc_client.py（MinIO
+客户端 mc），本模块在 mc 不可用（平台不支持 / 离线 / 下载失败）时接管，
+因为它纯标准库、零外部二进制，永远能跑。两者共用同一份凭据。
+
 为什么不用 minio / boto3：
 - 项目铁律是零第三方依赖（解压即用）。
-- 更关键的是实测结论：BOS 的 bj.bcebos.com 端点**不接受 AWS SigV4**
-  （直接 400 MissingDateHeader），minio / boto3 这类 S3 客户端签不出它要的签名。
-  BOS 用的是自家 `bce-auth-v1` 签名协议。
-- 该协议只需 hmac-sha256 + urllib，标准库足够，故在此手写。
+- 实测结论：BOS 的**原生端点** bj.bcebos.com 不接受 AWS SigV4
+  （直接 400 MissingDateHeader），它用的是自家 `bce-auth-v1` 签名协议。
+  注意这个结论**只对原生端点成立**：BOS 另有 S3 兼容端点
+  s3.bj.bcebos.com，SigV4 在那里是正常的（mc 走的就是它）。
+- bce-auth-v1 只需 hmac-sha256 + urllib，标准库足够，故在此手写。
 
 签名协议（BCE Authorization V1，已实测验证）：
   authStringPrefix = "bce-auth-v1/{ak}/{utc_iso8601}/{expire_seconds}"
