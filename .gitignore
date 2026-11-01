@@ -24,3 +24,6 @@ __pycache__/
 
 # macOS 系统文件
 .DS_Store
+
+# 对象存储（BOS）凭据：含 AK/SK，严禁入库。模板见 .nanocode_bos.json.example
+.nanocode_bos.json

@@ -17,8 +17,10 @@ import datetime
 import json
 import os
 
-# 改动记录统一存放在脚本同级的 .nanocode_changes/ 目录下
-CHANGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nanocode_changes")
+# 改动记录统一存放在项目根目录 .nanocode_changes/ 下。
+# 本模块位于 session/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHANGES_DIR = os.path.join(_BASE_DIR, ".nanocode_changes")
 # 所有改动追加写入同一个 JSONL 文件，每行一条记录
 CHANGES_FILE = os.path.join(CHANGES_DIR, "changes.jsonl")
 

@@ -7,10 +7,15 @@
   拿到相关片段（含文件路径+行号）后再决定是否 read 原文。这叫 agentic search：
   "由 agent 决定何时搜、搜几次"，BM25 只是 kb_search 的内部检索后端，二者正交。
 
-- 为什么是 BM25 而不是向量检索？第一期要"零依赖、可随包分发、团队解压即用"。
-  BM25 是稀疏/关键词检索，只数词频，用标准库 collections+math 手写约几十行即可，
-  不需要 embedding 模型、不需要联网、不需要装 numpy/faiss。向量（稠密/语义）检索
-  效果更好但需要 embedding 端点与额外依赖，放到第二期（见 DEVELOPER.md 的 TODO）。
+- 两期检索后端（通过 config.json 的 backend 字段切换）：
+  * 第一期 bm25（默认）：稀疏/关键词检索，只数词频，用标准库 collections+math 手写
+    约几十行即可，零依赖、不联网、解压即用。适合关键词/专有名词/代码符号精确命中。
+  * 第二期 vector / hybrid（可选，方案 A）：静态词向量做稠密/语义检索，
+    "换一种说法也能召回"。模型侧全部收口在 embedding.py / static_vec.py：向量资产
+    （约 14MB）随包放在 knowledge/assets/，零下载零联网，唯一可选依赖是 numpy。
+    hybrid 用 RRF 融合 BM25 与向量结果。
+  * 关键回退：向量后端需要 numpy 与资产文件；任一缺失时本模块自动降级到 bm25，
+    保证"解压即用"的 BM25 路径永不受影响（见 _resolve_backend / search）。
 
 - 构建期 vs 运行期（分发关键）：
   * 构建期：知识库作者在本机运行 `/kb index <目录>`，把语料切块+建索引，
@@ -24,10 +29,11 @@
   生命周期独立于单次会话；用独立目录分开存，职责清晰、便于整体打包迁移。
 
 存储布局（.nanocode_kb/ 下）：
-  config.json    —— 后端类型与分块参数（backend=bm25、chunk 配置、bm25 超参）
+  config.json    —— 后端类型与分块参数（backend=bm25/vector/hybrid、chunk 配置、bm25 超参、embedding 模型名）
   chunks.jsonl   —— 每行一个片段：{id, source, start_line, end_line, title, text}
   index.json     —— BM25 索引：df（文档频率）、每片段的词频与长度、全局统计
   sources.json   —— 已索引文件清单及 mtime（支持 /kb index 增量重建，跳过未变文件）
+  vectors.jsonl  —— （vector/hybrid 后端才有）每行一个片段向量：{id, vec}，已 L2 归一化
 """
 
 import json
@@ -36,12 +42,24 @@ import os
 import re
 from collections import Counter, defaultdict
 
-# 知识库统一存放在"脚本同级"的 .nanocode_kb/ 目录（分发后随包迁移、与 cwd 无关）
-KB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nanocode_kb")
+from . import embedding
+
+# 知识库统一存放在项目根目录 .nanocode_kb/（分发后随包迁移、与 cwd 无关）。
+# 本模块位于 knowledge/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KB_DIR = os.path.join(_BASE_DIR, ".nanocode_kb")
 CONFIG_FILE = os.path.join(KB_DIR, "config.json")
 CHUNKS_FILE = os.path.join(KB_DIR, "chunks.jsonl")
 INDEX_FILE = os.path.join(KB_DIR, "index.json")
 SOURCES_FILE = os.path.join(KB_DIR, "sources.json")
+VECTORS_FILE = os.path.join(KB_DIR, "vectors.jsonl")
+
+# 检索后端：bm25（默认，零依赖）/ vector（纯语义）/ hybrid（BM25+向量 RRF 融合）。
+# 默认仍是 bm25，保证"解压即用"路径不变；向量后端需要可选依赖 numpy（见 embedding.py）。
+DEFAULT_BACKEND = "bm25"
+VALID_BACKENDS = ("bm25", "vector", "hybrid")
+# hybrid 融合用的 RRF 常数：名次 r 的贡献为 1/(RRF_K + r)，K 越大越平滑。
+RRF_K = 60
 
 # BM25 经典超参：k1 控制词频饱和、b 控制文档长度归一化，取通用默认值即可
 BM25_K1 = 1.5
@@ -230,13 +248,21 @@ def _iter_text_files(root):
 # --- 索引构建 ---
 
 
-def build_index(root, append=False):
-    """扫描 root 下文本文件，分块并构建 BM25 索引，落盘到 .nanocode_kb/。
+def build_index(root, append=False, backend=None):
+    """扫描 root 下文本文件，分块并构建索引，落盘到 .nanocode_kb/。
 
     append=False 全量重建；append=True 在已有索引基础上增量合并（跳过 mtime 未变的文件）。
-    返回统计 dict：{files, chunks, skipped}。
+    backend=None 时沿用已有 config 的后端（没有则默认 bm25）；也可显式传 bm25/vector/hybrid。
+    无论哪种后端都会构建 BM25 索引（hybrid 需要、也让回退有依据）；vector/hybrid 额外编码向量。
+    返回统计 dict：{files, chunks, skipped, backend, vectors}。
     """
     _ensure_dir()
+    # 决定本次使用的后端：显式参数优先，否则沿用已有配置
+    if backend is None:
+        backend = (_load_config() or {}).get("backend", DEFAULT_BACKEND)
+    if backend not in VALID_BACKENDS:
+        backend = DEFAULT_BACKEND
+
     # 载入已有片段与来源（增量模式用）
     existing_chunks, sources = [], {}
     if append and os.path.exists(CHUNKS_FILE):
@@ -293,8 +319,39 @@ def build_index(root, append=False):
     _build_bm25(all_chunks)
     _save_chunks(all_chunks)
     _save_sources(sources)
-    _save_config()
-    return {"files": len(changed_files), "chunks": len(all_chunks), "skipped": skipped}
+
+    # vector/hybrid：编码全部片段向量并落盘。依赖/资产缺失或编码失败时回退 bm25 并给出原因。
+    n_vectors = 0
+    emb_model = None
+    emb_dim = None
+    effective_backend = backend
+    vector_note = ""
+    if backend in ("vector", "hybrid"):
+        if not embedding.available():
+            effective_backend = "bm25"
+            vector_note = "（向量编码不可用，已回退 bm25；运行 /kb model 查看原因与解决方法）"
+        else:
+            try:
+                vecs = embedding.encode_docs([c["text"] for c in all_chunks])
+                _save_vectors(all_chunks, vecs)
+                n_vectors = len(vecs)
+                emb_model = embedding.model_name()
+                emb_dim = embedding.dim()
+            except Exception as err:
+                effective_backend = "bm25"
+                vector_note = f"（向量编码失败已回退 bm25：{err}）"
+    if effective_backend == "bm25":
+        _clear_vectors()
+
+    _save_config(effective_backend, emb_model, emb_dim)
+    return {
+        "files": len(changed_files),
+        "chunks": len(all_chunks),
+        "skipped": skipped,
+        "backend": effective_backend,
+        "vectors": n_vectors,
+        "note": vector_note,
+    }
 
 
 def _build_bm25(chunks):
@@ -369,17 +426,74 @@ def _load_sources():
         return {}
 
 
-def _save_config():
-    """记录本次索引所用的后端与参数，便于审计与第二期平滑升级。"""
+def _save_vectors(chunks, vecs):
+    """向量以 JSONL 落盘（每行 {id, vec}），与片段一一对应、便于逐行加载。"""
+    _ensure_dir()
+    with open(VECTORS_FILE, "w", encoding="utf-8") as f:
+        for c, v in zip(chunks, vecs):
+            f.write(json.dumps({"id": c["id"], "vec": v}, ensure_ascii=False) + "\n")
+
+
+def _load_vectors():
+    """读回 {doc_id: [float,...]}；文件不存在返回空 dict。"""
+    if not os.path.exists(VECTORS_FILE):
+        return {}
+    out = {}
+    try:
+        with open(VECTORS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                out[row["id"]] = row["vec"]
+    except Exception:
+        return {}
+    return out
+
+
+def _clear_vectors():
+    """删除向量文件（后端回退 bm25 时调用，避免残留旧向量误导检索）。"""
+    try:
+        if os.path.exists(VECTORS_FILE):
+            os.remove(VECTORS_FILE)
+    except OSError:
+        pass
+
+
+def _save_config(backend=DEFAULT_BACKEND, emb_model=None, emb_dim=None):
+    """记录本次索引所用的后端与参数，便于审计与运行期后端分发。"""
     _ensure_dir()
     config = {
-        "backend": "bm25",
+        "backend": backend,
         "bm25": {"k1": BM25_K1, "b": BM25_B},
         "chunk": {"max_chars": CHUNK_MAX_CHARS, "overlap": CHUNK_OVERLAP},
         "tokenizer": "en-word + cjk-bigram",
     }
+    if backend in ("vector", "hybrid"):
+        config["embedding"] = {"model": emb_model, "dim": emb_dim}
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def _load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _resolve_backend():
+    """返回运行期实际可用的后端：配置要向量但库不可用/向量缺失时回退 bm25。"""
+    cfg = _load_config() or {}
+    backend = cfg.get("backend", DEFAULT_BACKEND)
+    if backend in ("vector", "hybrid"):
+        if not embedding.available() or not os.path.exists(VECTORS_FILE):
+            return "bm25"
+    return backend
 
 
 def _load_index():
@@ -393,7 +507,46 @@ def _load_index():
 
 
 def search(query, k=5):
-    """用 BM25 对查询打分，返回 top-k 片段（含来源路径+行号+标题+文本）。
+    """按已配置后端检索 top-k 片段（含来源路径+行号+标题+文本）。
+
+    后端由 _resolve_backend() 决定：
+      bm25   —— 纯关键词检索（_bm25_search）
+      vector —— 纯语义向量检索（_vector_search）
+      hybrid —— BM25 与向量各出排名，用 RRF 融合（_hybrid_search）
+    若配置要向量但依赖不可用或向量缺失，_resolve_backend 会回退到 bm25。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    backend = _resolve_backend()
+    if backend == "vector":
+        ranked = _vector_search(q, k)
+    elif backend == "hybrid":
+        ranked = _hybrid_search(q, k)
+    else:
+        ranked = _bm25_search(q, k)
+    if not ranked:
+        return []
+
+    chunks = list(_load_chunks())
+    results = []
+    for score, doc_id in ranked:
+        if doc_id < 0 or doc_id >= len(chunks):
+            continue
+        c = chunks[doc_id]
+        results.append({
+            "score": round(score, 4),
+            "source": c["source"],
+            "start_line": c["start_line"],
+            "end_line": c["end_line"],
+            "title": c["title"],
+            "text": c["text"],
+        })
+    return results
+
+
+def _bm25_search(query, k):
+    """BM25 打分，返回 [(score, doc_id), ...]（已按分数降序、取 top-k）。
 
     BM25 公式（对每个查询 term 求和）：
       idf(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )
@@ -403,7 +556,6 @@ def search(query, k=5):
     index = _load_index()
     if not index or index.get("n_docs", 0) == 0:
         return []
-    chunks = list(_load_chunks())
     df = index["df"]
     doc_len = index["doc_len"]
     tf = index["tf"]
@@ -427,39 +579,101 @@ def search(query, k=5):
             denom = f + BM25_K1 * (1 - BM25_B + BM25_B * dl / avg_len)
             scores[doc_id] += idf * (f * (BM25_K1 + 1)) / denom
 
-    # 取分数 > 0 的 top-k
-    ranked = sorted(
+    return sorted(
         [(s, i) for i, s in enumerate(scores) if s > 0],
         key=lambda x: x[0],
         reverse=True,
     )[:k]
-    results = []
-    for score, doc_id in ranked:
-        c = chunks[doc_id]
-        results.append({
-            "score": round(score, 4),
-            "source": c["source"],
-            "start_line": c["start_line"],
-            "end_line": c["end_line"],
-            "title": c["title"],
-            "text": c["text"],
-        })
-    return results
+
+
+def _vector_search(query, k):
+    """语义向量检索：编码查询后与各片段向量算点积（均 L2 归一化=余弦），取 top-k。
+
+    返回 [(cosine, doc_id), ...]（降序）。向量缺失或编码失败时返回空。
+    片段上千条时纯 Python 双层循环会到百毫秒级，故优先走 numpy 矩阵乘，
+    numpy 不可用时回退纯 Python（功能等价，只是慢）。
+    """
+    vectors = _load_vectors()
+    if not vectors:
+        return []
+    try:
+        qv = embedding.encode_query(query)
+    except Exception:
+        return []
+    dim = len(qv)
+    doc_ids = [d for d, v in vectors.items() if len(v) == dim]
+    if not doc_ids:
+        return []
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+    if np is not None:
+        matrix = np.asarray([vectors[d] for d in doc_ids], dtype=np.float32)
+        scores = matrix @ np.asarray(qv, dtype=np.float32)
+        top = min(k, len(doc_ids))
+        # argpartition 只做 top-k 部分排序，比全量 sort 更省；再对这 k 个精排
+        idx = np.argpartition(-scores, top - 1)[:top]
+        idx = idx[np.argsort(-scores[idx])]
+        return [(float(scores[i]), doc_ids[i]) for i in idx]
+    scored = []
+    for doc_id in doc_ids:
+        vec = vectors[doc_id]
+        dot = 0.0
+        for a, b in zip(qv, vec):
+            dot += a * b
+        scored.append((dot, doc_id))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:k]
+
+
+def _hybrid_search(query, k):
+    """混合检索：BM25 与向量各自出排名，用 RRF（Reciprocal Rank Fusion）融合。
+
+    RRF：对每路结果，第 rank 名（从 0 起）贡献 1/(RRF_K+rank+1)，两路相加得融合分。
+    这样无需对 BM25 分数与余弦做量纲对齐，鲁棒且实现简单。取融合分 top-k。
+    """
+    # 两路各多取一些候选，融合后再截断，避免边界漏召回
+    pool = max(k * 3, k)
+    bm25 = _bm25_search(query, pool)
+    vec = _vector_search(query, pool)
+    if not vec:
+        # 向量不可用时退化为 BM25
+        return bm25[:k]
+
+    fused = defaultdict(float)
+    for rank, (_s, doc_id) in enumerate(bm25):
+        fused[doc_id] += 1.0 / (RRF_K + rank + 1)
+    for rank, (_s, doc_id) in enumerate(vec):
+        fused[doc_id] += 1.0 / (RRF_K + rank + 1)
+    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [(score, doc_id) for doc_id, score in ranked]
 
 
 def stat():
-    """返回知识库概况：是否已建、片段数、来源文件数、后端类型。"""
+    """返回知识库概况：是否已建、片段数、来源文件数、后端类型与模型信息。"""
     index = _load_index()
     sources = _load_sources()
     if not index:
         return {"built": False}
-    return {
+    cfg = _load_config() or {}
+    configured = cfg.get("backend", DEFAULT_BACKEND)
+    effective = _resolve_backend()
+    out = {
         "built": True,
-        "backend": "bm25",
+        "backend": configured,
+        "effective_backend": effective,
         "chunks": index.get("n_docs", 0),
         "files": len(sources),
         "kb_dir": KB_DIR,
     }
+    emb = cfg.get("embedding") or {}
+    if emb:
+        out["model"] = emb.get("model")
+        out["dim"] = emb.get("dim")
+    if os.path.exists(VECTORS_FILE):
+        out["vectors"] = len(_load_vectors())
+    return out
 
 
 # --- 工具层：供 nanocode 的 kb_search 工具调用 ---
@@ -501,18 +715,26 @@ def kb_search(args):
 # --- 命令层：供 /kb REPL 命令调用 ---
 
 
-def cmd_index(path, append=False):
-    """/kb index <目录> 的后端：建立或增量更新索引，返回人类可读的结果文本与统计。"""
+def cmd_index(path, append=False, backend=None):
+    """/kb index <目录> 的后端：建立或增量更新索引，返回人类可读的结果文本与统计。
+
+    backend 可选 bm25/vector/hybrid；None 时沿用已有配置（首次为 bm25）。
+    """
     if not path:
-        return {"ok": False, "msg": "用法: /kb index <目录或文件>"}
+        return {"ok": False, "msg": "用法: /kb index <目录或文件> [--backend bm25|vector|hybrid]"}
     if not os.path.exists(path):
         return {"ok": False, "msg": f"路径不存在: {path}"}
-    info = build_index(path, append=append)
+    if backend is not None and backend not in VALID_BACKENDS:
+        return {"ok": False, "msg": f"未知后端 '{backend}'，可选: {', '.join(VALID_BACKENDS)}"}
+    info = build_index(path, append=append, backend=backend)
     mode = "增量更新" if append else "全量重建"
     msg = (
         f"{mode}完成：处理 {info['files']} 个文件，"
         f"共 {info['chunks']} 个片段"
         + (f"，跳过 {info['skipped']} 个未变文件" if info["skipped"] else "")
+        + f"。后端: {info['backend']}"
+        + (f"（向量 {info['vectors']} 条）" if info["vectors"] else "")
+        + (info["note"] or "")
         + f"。索引已保存到 {KB_DIR}"
     )
     return {"ok": True, "msg": msg}
@@ -523,10 +745,22 @@ def cmd_stat():
     st = stat()
     if not st.get("built"):
         return {"ok": True, "msg": "知识库尚未建立。用 /kb index <目录> 建立索引。"}
-    return {
-        "ok": True,
-        "msg": (
-            f"后端: {st['backend']} | 片段: {st['chunks']} | "
-            f"来源文件: {st['files']} | 目录: {st['kb_dir']}"
-        ),
-    }
+    parts = [
+        f"后端: {st['backend']}",
+    ]
+    if st.get("effective_backend") and st["effective_backend"] != st["backend"]:
+        parts.append(f"(实际: {st['effective_backend']})")
+    parts.append(f"片段: {st['chunks']}")
+    parts.append(f"来源文件: {st['files']}")
+    if st.get("model"):
+        parts.append(f"模型: {st['model']}" + (f"/{st['dim']}维" if st.get("dim") else ""))
+    if st.get("vectors"):
+        parts.append(f"向量: {st['vectors']}")
+    parts.append(f"目录: {st['kb_dir']}")
+    return {"ok": True, "msg": " | ".join(parts)}
+
+
+def cmd_model():
+    """/kb model 的后端：主动加载向量资产并返回状态（无需联网下载）。"""
+    res = embedding.ensure_model()
+    return {"ok": res["ok"], "msg": res["msg"]}

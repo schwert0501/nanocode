@@ -9,8 +9,10 @@ import datetime
 import json
 import os
 
-# 会话文件统一存放在脚本同级的 .nanocode_sessions/ 目录下，每个会话一个 JSON 文件
-SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nanocode_sessions")
+# 会话文件统一存放在项目根目录 .nanocode_sessions/ 下，每个会话一个 JSON 文件。
+# 本模块位于 session/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SESSIONS_DIR = os.path.join(_BASE_DIR, ".nanocode_sessions")
 
 
 def _ensure_dir():

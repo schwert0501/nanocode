@@ -34,8 +34,10 @@ front-matter 用首部 `---` 包裹的极简 key: value，只认 name/triggers/d
 import glob as globlib
 import os
 
-# SKILL 统一存放在"脚本同级"的 .nanocode_skills/ 目录（分发后随包迁移、与 cwd 无关）
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nanocode_skills")
+# SKILL 统一存放在项目根目录 .nanocode_skills/（分发后随包迁移、与 cwd 无关）。
+# 本模块位于 knowledge/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SKILLS_DIR = os.path.join(_BASE_DIR, ".nanocode_skills")
 
 
 def _ensure_dir():

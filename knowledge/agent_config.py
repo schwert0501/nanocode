@@ -17,8 +17,10 @@ AGENTS.md 约定按二级标题分段，本模块只提取三段注入 system_pr
 
 import os
 
-# AGENTS.md 与脚本同级（分发后随包迁移、与 cwd 无关）
-AGENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AGENTS.md")
+# AGENTS.md 位于项目根目录（分发后随包迁移、与 cwd 无关）。
+# 本模块位于 knowledge/ 子包，需上溯一层到项目根。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AGENTS_FILE = os.path.join(_BASE_DIR, "AGENTS.md")
 
 # 需要注入 system_prompt 的章节（二级标题名，大小写不敏感），按此顺序拼接
 _INJECT_SECTIONS = ["IDENTITY", "GLOSSARY", "BEHAVIOR"]
