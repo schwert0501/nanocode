@@ -5,12 +5,28 @@
 # 只要有 Python 3.8+ 即可“解压即用”，无需 pip install。
 #
 # ─────────────────────────────────────────────────────────────
-# 可选：知识库“第二版本”语义检索后端（/kb index --backend vector|hybrid）
+# 可选：知识库语义检索后端（/kb index --backend vector|hybrid）
 # ─────────────────────────────────────────────────────────────
-# 安装后，知识库可从 BM25 关键词检索升级为本地 embedding 语义检索，
-# 首次使用会自动下载一个小型中文向量模型（默认 BAAI/bge-small-zh-v1.5，约 95MB）。
-# 不安装则自动回退到 BM25，不影响其余功能。
+# 语义检索用的是「随包分发的静态词向量资产」（knowledge/assets/，约 14MB），
+# 不下载模型、不联网、不需要 torch / transformers / sentence-transformers。
+# 唯一的额外依赖是 numpy（int8 反量化 + 余弦相似度矩阵运算）：
 #
-#   pip install sentence-transformers
+#   pip install numpy
 #
-# sentence-transformers>=2.2.0
+# 不安装 numpy 则 vector/hybrid 自动回退到 BM25，不影响其余功能。
+# 运行 /kb model 可查看向量引擎是否就绪。
+#
+# numpy>=1.20
+
+# -----------------------------------------------------------------------------
+# 对象存储上传（知识缺口 → BOS problem/）同样**不需要**任何第三方依赖。
+#
+# 不用 minio / boto3 的原因：百度 BOS 不接受 AWS SigV4 签名
+# （实测向 <bucket>.bj.bcebos.com 发 SigV4 请求返回
+#  400 MissingDateHeader，要求 date / x-bce-date 头），
+# 它用的是自家 bce-auth-v1 协议。该协议只需 hmac + hashlib + urllib，
+# 标准库完全够用，已在 knowledge/bos.py 中实现。
+#
+# 配置方式：复制 .nanocode_bos.json.example 为 .nanocode_bos.json 填入 AK/SK
+# （该文件已在 .gitignore 中），或导出 BOS_ACCESS_KEY / BOS_SECRET_KEY /
+# BOS_BUCKET / BOS_ENDPOINT 环境变量。不配置则缺口记录纯本地，零外部调用。

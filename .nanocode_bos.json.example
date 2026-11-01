@@ -1,0 +1,6 @@
+{
+  "access_key": "填入你的 BOS Access Key",
+  "secret_key": "填入你的 BOS Secret Key",
+  "bucket": "linshi-bucket",
+  "endpoint": "bj.bcebos.com"
+}
