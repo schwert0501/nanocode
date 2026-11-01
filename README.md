@@ -55,7 +55,7 @@ python nanocode.py
 python nanocode.py --bypass
 ```
 
-**依赖**：核心运行时**零第三方依赖**（纯标准库）。仅当你要用知识库的向量/混合检索后端时，才需要可选依赖 `sentence-transformers`，详见 [`requirements.txt`](requirements.txt)。
+**依赖**：核心运行时**零第三方依赖**（纯标准库）。仅当你要用知识库的向量/混合检索后端时，才需要可选依赖 `numpy`（向量资产已随包分发，无需下载模型），详见 [`requirements.txt`](requirements.txt)。
 
 ---
 
@@ -107,10 +107,10 @@ python nanocode.py --bypass
 | 后端 | 原理 | 依赖 |
 |------|------|------|
 | `bm25`（默认） | 稀疏词频检索 + 长度归一化 | 纯标准库 |
-| `vector` | 本地 embedding 语义向量 + 余弦 Top-k | 可选 `sentence-transformers` |
+| `vector` | 随包静态词向量 + 余弦 Top-k | 可选 `numpy` |
 | `hybrid` | BM25 + 向量用 RRF 融合 | 同 vector |
 
-> 未装 embedding 库时，`vector`/`hybrid` 会优雅回退到 `bm25`，不影响使用。默认向量模型 `BAAI/bge-small-zh-v1.5`（约 95MB，首次使用自动下载，可用 `NANOCODE_EMBED_MODEL` 覆盖）。
+> 向量资产（约 14MB）随包放在 `knowledge/assets/`，**不下载模型、不联网、不需要 torch**。唯一可选依赖是 `numpy`；未装 numpy 或资产缺失时，`vector`/`hybrid` 会优雅回退到 `bm25`，不影响使用。运行 `/kb model` 可查看向量引擎状态。
 
 **知识库命令**：
 

@@ -165,10 +165,10 @@
 | 后端 | 原理 | 依赖 | 适合 |
 |------|------|------|------|
 | `bm25`（默认） | 稀疏词频检索，带文档长度归一化 | 纯标准库，零第三方 | 关键词/专有名词/代码符号命中 |
-| `vector` | 本地 embedding 语义向量 + 余弦 Top-k | 需 `sentence-transformers`（可选） | 语义近似、换种说法也能召回 |
+| `vector` | 随包静态词向量 + 余弦 Top-k | 可选 `numpy`（资产随包，无需下载） | 语义近似、换种说法也能召回 |
 | `hybrid` | BM25 + 向量结果用 RRF 融合排序 | 同 vector | 兼顾关键词精确与语义泛化 |
 
-> 关键澄清：**生成模型 ≠ embedding 模型**。**agentic search 是范式**（模型自主决定搜不搜、搜几次、要不要深读），BM25/向量只是 `kb_search` 内部可替换的后端。未装 embedding 库时，`vector`/`hybrid` 会优雅回退到 BM25，不影响使用。
+> 关键澄清：**生成模型 ≠ embedding 模型**。**agentic search 是范式**（模型自主决定搜不搜、搜几次、要不要深读），BM25/向量只是 `kb_search` 内部可替换的后端。向量引擎不可用（未装 numpy / 资产缺失）时，`vector`/`hybrid` 会优雅回退到 BM25，不影响使用。
 
 **存储布局（`.nanocode_kb/`）**：
 
@@ -239,21 +239,25 @@ python nanocode.py --bypass
 
 # 第二部分 · 迭代路线与设计决策
 
-## A. 知识库 v2：本地 embedding 语义检索（已落地，可选）
+## A. 知识库 v2：随包静态词向量语义检索（已落地，可选）
 
-**动机**：BM25 只能命中关键词；用户换一种说法（语义近似）时召回不到。v2 引入本地 embedding，把知识库升级为语义检索。
+**动机**：BM25 只能命中关键词；用户换一种说法（语义近似）时召回不到。v2 引入本地向量编码，把知识库升级为语义检索。
 
-**设计（方案 A：本地模型 + 可选依赖 + 优雅回退）**：
-- 新增 `knowledge/embedding.py` 封装全部第三方依赖，对外只暴露 `available/encode_docs/encode_query/ensure_model/model_name/dim/install_hint`。
-- 默认模型 `BAAI/bge-small-zh-v1.5`（约 95MB，中文检索友好），首次使用自动下载；可用环境变量 `NANOCODE_EMBED_MODEL` 覆盖。
-- bge 系列为**非对称检索**：query 侧加指令前缀、doc 侧不加；两侧都 `normalize_embeddings=True` 输出 L2 归一化向量，检索用余弦（点积）Top-k。
-- 模型懒加载 + 模块级缓存，避免重复初始化。
-- **三处回退鲁棒性**：建索引时装库失败/未装库 → 回退 BM25 并清空向量；`_resolve_backend` 运行期检测库不可用或向量缺失 → 回退；`hybrid` 向量路为空 → 退化纯 BM25。
-- `hybrid` 用 RRF（Reciprocal Rank Fusion，`RRF_K=60`）融合 BM25 与向量排序。
+**设计（方案 A：随包静态词向量 + numpy 可选依赖 + 优雅回退）**：
+- `knowledge/embedding.py` 是 kb.py 与编码引擎之间的唯一接口层，对外只暴露 `available/encode_docs/encode_query/ensure_model/model_name/dim/install_hint`。
+- `knowledge/static_vec.py` 是实际编码引擎：纯标准库实现 Unigram/Viterbi 分词（NFKC 归一化 + `▁` metaspace），再对命中 token 的词向量取均值并 L2 归一化。
+- 向量资产随包放在 `knowledge/assets/`（约 14MB，三个文件）：`vocab.tsv`（51,166 行 `piece\tscore`，行序即 id）、`emb.i8`（`[51166,256]` int8 raw）、`scale.f32`（per-row 反量化系数）。还原公式 `M_f32 = emb_i8.astype(float32) * scale`。
+- 资产来源：`minishlab/potion-multilingual-128M`（model2vec 静态词向量，原始 `[500353,256]` F32 约 489MB）→ 词表裁剪（前 30000 高频 ∪ 全部含 CJK 条目）→ per-row int8 量化。实测 Top-1 命中与全量模型基本持平（7/10 vs 8/10），与全量打分相关性 0.958。
+- **为什么不用 sentence-transformers**：它会拖进 torch（几百 MB 到 1GB+），且模型需联网下载到 `~/.cache/huggingface`，与「解压即用」的分发前提冲突。静态词向量只需查表求均值，推理零神经网络。
+- 静态词向量是**对称编码**：query 与 doc 走完全相同的管道，不存在 bge 系列那种 query 指令前缀。
+- 资产懒加载 + 模块级缓存（加载约 0.04s），避免重复初始化。
+- **三处回退鲁棒性**：建索引时引擎不可用/编码失败 → 回退 BM25 并清空向量；`_resolve_backend` 运行期检测引擎不可用或向量缺失 → 回退；`hybrid` 向量路为空 → 退化纯 BM25。
+- `hybrid` 用 RRF（Reciprocal Rank Fusion，`RRF_K=60`）融合 BM25 与向量排序。注意静态词向量的绝对分数区间偏低（中文 0.26~0.53），**只有相对排序有意义，不可设绝对阈值**，这也是选 hybrid+RRF 而非分数过滤的原因。
+- `_vector_search` 优先走 numpy 矩阵乘 + `argpartition` 取 top-k，numpy 缺失时回退纯 Python 点积（功能等价，仅变慢）。
 
-**依赖**：`sentence-transformers` 列为**可选**依赖（见 `requirements.txt`）。不装则知识库行为与 v1 完全一致（纯 BM25）。
+**依赖**：`numpy` 列为**可选**依赖（见 `requirements.txt`）。不装则知识库行为与 v1 完全一致（纯 BM25）。
 
-**状态**：代码链路已全部打通并本地回归（BM25 路径正常、向量请求未装库时优雅回退）。向量真实运行需在装好 `sentence-transformers` 的环境验证。
+**状态**：全链路已本地实测通过（`/kb model` 预热就绪、`/kb index --backend hybrid` 成功落盘向量、`kb_search` 正常召回）。
 
 ---
 
